@@ -25,10 +25,6 @@ class ParserSolidityResult(TypedDict, total=False):
     ast: Dict[str, Any]
     functions: List[Dict[str, Any]]
     contracts: List[Dict[str, Any]]
-    modifiers: List[Dict[str, Any]]
-    events: List[Dict[str, Any]]
-    structs: List[Dict[str, Any]]
-    enums: List[Dict[str, Any]]
 
 
 def _ensure_solc_auto_by_pragma(input_code: str, fallback_version: str | None = "0.8.26") -> str:
@@ -96,41 +92,44 @@ def _string_or_none(v: Any) -> Optional[str]:
     return v if isinstance(v, str) else None
 
 
-def _extract_contracts(ast: Dict[str, Any]) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    for n in _iter_nodes(ast):
-        if _node_kind(n) == "PragmaDirective":
-            continue
-        if _node_kind(n) in ("ContractDefinition", "SourceUnit"):  
-            if _node_kind(n) == "ContractDefinition":
-                kind = _string_or_none(n.get("contractKind")) or "contract"
-                name = _string_or_none(n.get("name")) or ""
-                bases = []
-                for b in n.get("baseContracts", []) or []:
-                    bn = b.get("baseName", {}).get("name")
-                    if bn:
-                        bases.append(bn)
-                out.append(
-                    {
-                        "name": name,
-                        "kind": kind, 
-                        "bases": bases,
-                    }
-                )
+def _extract_contracts_with_members(ast: Dict[str, Any]) -> List[Dict[str, Any]]:
+    contracts: List[Dict[str, Any]] = []
 
-        for ch in _iter_nodes(n):
-            if _node_kind(ch) == "ContractDefinition":
-                kind = _string_or_none(ch.get("contractKind")) or "contract"
-                name = _string_or_none(ch.get("name")) or ""
-                bases = []
-                for b in ch.get("baseContracts", []) or []:
-                    bn = b.get("baseName", {}).get("name")
-                    if bn:
-                        bases.append(bn)
-                out.append({"name": name, "kind": kind, "bases": bases})
+    def _extract_contract_header(node: Dict[str, Any]) -> Dict[str, Any]:
+        kind = _string_or_none(node.get("contractKind")) or "contract"
+        name = _string_or_none(node.get("name")) or ""
+        bases: List[str] = []
+        for b in node.get("baseContracts", []) or []:
+            bn = b.get("baseName", {}).get("name")
+            if bn:
+                bases.append(bn)
+        return {"name": name, "kind": kind, "bases": bases}
 
-    uniq = {}
-    for c in out:
+    def walk(node: Dict[str, Any]) -> None:
+        if _node_kind(node) == "ContractDefinition":
+            header = _extract_contract_header(node)
+            members = _collect_from_contract(node)
+            contracts.append(
+                {
+                    **header,
+                    "functions": members["functions"],
+                    "modifiers": members["modifiers"],
+                    "events": members["events"],
+                    "structs": members["structs"],
+                    "enums": members["enums"],
+                }
+            )
+            # Не идём внутрь этого узла дальше, так как _collect_from_contract уже прошёл его детей
+            return
+
+        for ch in _iter_nodes(node):
+            walk(ch)
+
+    walk(ast)
+
+    # Убираем возможные дубликаты по (name, kind) сохраняя последний вариант
+    uniq: Dict[tuple, Dict[str, Any]] = {}
+    for c in contracts:
         uniq[(c["name"], c["kind"])] = c
     return list(uniq.values())
 
@@ -271,41 +270,6 @@ def _collect_from_contract(contract_node: Dict[str, Any]) -> Dict[str, List[Dict
         "enums": enums,
     }
 
-
-def _extract_payload_from_ast(ast: Dict[str, Any]) -> Dict[str, Any]:
-    """SourceUnit -> ContractDefinition to collect summary."""
-    contracts_meta = _extract_contracts(ast)
-
-    functions: List[Dict[str, Any]] = []
-    modifiers: List[Dict[str, Any]] = []
-    events: List[Dict[str, Any]] = []
-    structs: List[Dict[str, Any]] = []
-    enums: List[Dict[str, Any]] = []
-
-    def walk(node: Dict[str, Any]) -> None:
-        kind = _node_kind(node)
-        if kind == "ContractDefinition":
-            res = _collect_from_contract(node)
-            functions.extend(res["functions"])
-            modifiers.extend(res["modifiers"])
-            events.extend(res["events"])
-            structs.extend(res["structs"])
-            enums.extend(res["enums"])
-        for ch in _iter_nodes(node):
-            walk(ch)
-
-    walk(ast)
-
-    return {
-        "contracts": contracts_meta,
-        "functions": functions,
-        "modifiers": modifiers,
-        "events": events,
-        "structs": structs,
-        "enums": enums,
-    }
-
-
 def run(
     input_code: str,
     *,
@@ -341,7 +305,9 @@ def run(
             _ensure_solc(chosen)
 
         ast = _compile_to_ast_with_solc(input_code, solc_version=chosen)
-        payload = _extract_payload_from_ast(ast)
+        payload =  {
+            "contracts":  _extract_contracts_with_members(ast)
+        }
 
         result: ParserSolidityResult = {
             "status": "ok",
@@ -351,7 +317,7 @@ def run(
             "meta": {
                 "duration_ms": int((time.time() - t0) * 1000),
                 "engine": engine,
-                "solc_version": solc_version,
+                "solc_version": chosen,
             },
             **payload,
         }

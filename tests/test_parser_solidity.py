@@ -1,4 +1,5 @@
 import pytest
+import json
 from mcp_modules.parser_solidity import run
 
 SIMPLE_CODE = """
@@ -68,7 +69,7 @@ def test_extract_contracts_and_functions():
     names = {c["name"] for c in res.get("contracts", [])}
     assert {"Ownable", "Vault"}.issubset(names)
 
-    fns = res.get("functions", [])
+    fns = res.get("contracts", [])[1].get("functions", [])
     fn_names = {f["name"] for f in fns}
     assert {"constructor", "receive", "withdraw", "viewTotal"}.issubset(fn_names)
 
@@ -85,8 +86,8 @@ def test_extract_contracts_and_functions():
 def test_extract_modifiers_definitions():
     res = run(SIMPLE_CODE, engine="solc", return_raw_ast=False, auto_version=True)
     _skip_if_error(res)
-
-    mods = res.get("modifiers", [])
+ 
+    mods = res.get("contracts", [])[0].get("modifiers", [])
     mod_names = {m["name"] for m in mods}
     assert "onlyOwner" in mod_names
 
@@ -95,12 +96,15 @@ def test_basic_function_signature_and_visibility():
     res = run(BASIC_FUNC_CODE, engine="solc", return_raw_ast=False, auto_version=True)
     _skip_if_error(res)
 
-    fns = res.get("functions", [])
+    fns = res.get("contracts", [])[0].get("functions", [])
     add = next(f for f in fns if f["name"] == "add")
     assert add["visibility"] == "public"
     assert add["stateMutability"] == "pure"
     sig = add["signature"]
     assert sig.startswith("add(uint") and "returns (uint" in sig
+
+    cT = next(c for c in res["contracts"] if c["name"] == "T")
+    assert "add" in {f["name"] for f in cT.get("functions", [])}
 
 
 def test_return_raw_ast_flag():
@@ -373,16 +377,27 @@ function withdraw_intou33() public {
 def test_extract_old_contracts_and_functions():
     res = run(OLD_CODE, engine="solc", return_raw_ast=False, auto_version=True)
     _skip_if_error(res)
-
     assert res["status"] == "ok"
 
     names = {c["name"] for c in res.get("contracts", [])}
     assert {"BitCash", "tokenRecipient"}.issubset(names)
 
-    fns = res.get("functions", [])
+    fns = res.get("contracts", [])[1].get("functions", [])
     fn_names = {f["name"] for f in fns}
     assert {"bug_intou20", "bug_intou32", "transfer_intou38", "bug_intou4", "increaseLockTime_intou33"}.issubset(fn_names)
+
 
     view_total = next(f for f in fns if f["name"] == "transfer_intou38")
     assert "returns" in view_total["signature"]
     assert "bool" in view_total["signature"]
+
+    contracts = {c["name"]: c for c in res.get("contracts", [])}
+    iface = contracts["tokenRecipient"]
+    bitcash = contracts["BitCash"]
+
+    assert "receiveApproval" in {f["name"] for f in iface.get("functions", [])}
+    assert "receiveApproval" not in {f["name"] for f in bitcash.get("functions", [])}
+    assert "transfer" in {f["name"] for f in bitcash.get("functions", [])}
+
+    with open("parsed_result.json", "w", encoding="utf-8") as f:
+        json.dump(res, f, indent=2, ensure_ascii=False, default=str)
