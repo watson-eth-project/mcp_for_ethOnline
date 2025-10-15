@@ -1,6 +1,6 @@
 import pytest
 import json
-from mcp_modules.parser_solidity import run
+from mcp_modules.parser_solidity import run, _ensure_solc_auto_by_pragma
 
 SIMPLE_CODE = """
 // SPDX-License-Identifier: MIT
@@ -62,7 +62,7 @@ def test_empty_input_error():
 
 
 def test_extract_contracts_and_functions():
-    res = run(SIMPLE_CODE, engine="solc", return_raw_ast=False, auto_version=True)
+    res = run(SIMPLE_CODE, engine="solc", auto_version=True)
     _skip_if_error(res)
 
     assert res["status"] == "ok"
@@ -84,7 +84,7 @@ def test_extract_contracts_and_functions():
 
 
 def test_extract_modifiers_definitions():
-    res = run(SIMPLE_CODE, engine="solc", return_raw_ast=False, auto_version=True)
+    res = run(SIMPLE_CODE, engine="solc", auto_version=True)
     _skip_if_error(res)
  
     mods = res.get("contracts", [])[0].get("modifiers", [])
@@ -93,7 +93,7 @@ def test_extract_modifiers_definitions():
 
 
 def test_basic_function_signature_and_visibility():
-    res = run(BASIC_FUNC_CODE, engine="solc", return_raw_ast=False, auto_version=True)
+    res = run(BASIC_FUNC_CODE, engine="solc", auto_version=True)
     _skip_if_error(res)
 
     fns = res.get("contracts", [])[0].get("functions", [])
@@ -107,297 +107,418 @@ def test_basic_function_signature_and_visibility():
     assert "add" in {f["name"] for f in cT.get("functions", [])}
 
 
-def test_return_raw_ast_flag():
-    res = run(BASIC_FUNC_CODE, engine="solc", return_raw_ast=True, auto_version=True)
+def test_persist_ast_flag():
+    res = run(BASIC_FUNC_CODE, engine="solc", persist_ast=False, auto_version=True)
     _skip_if_error(res)
 
     assert res["status"] == "ok"
-    assert "ast" in res and isinstance(res["ast"], dict)
+    # Should not have ast_uri when persist_ast=False
+    assert "ast_uri" not in res
+
+
+def test_ast_caching_and_uri():
+    """Test that AST is properly cached and URI is generated."""
+    res = run(BASIC_FUNC_CODE, engine="solc", persist_ast=True, auto_version=True)
+    _skip_if_error(res)
+
+    assert res["status"] == "ok"
+    assert "ast_uri" in res
+    assert res["ast_uri"].startswith("ast://")
+    
+    # Extract hash from URI
+    uri = res["ast_uri"]
+    hash_match = uri.split("://")[1]
+    assert len(hash_match) == 8
+    assert all(c in "0123456789abcdef" for c in hash_match.lower())
+
+
+def test_metadata_fields():
+    """Test that all metadata fields are present."""
+    res = run(BASIC_FUNC_CODE, engine="solc", persist_ast=True, auto_version=True)
+    _skip_if_error(res)
+
+    assert res["status"] == "ok"
+    
+    meta = res["meta"]
+    
+    # Required fields
+    assert "duration_ms" in meta
+    assert "engine" in meta
+    assert "solc_version" in meta
+    
+    # New metadata fields
+    assert "pragma" in meta
+    assert meta["pragma"] == "^0.8.26"
+    
+    # AST caching metadata
+    assert "ast_hash" in meta
+    assert "ast_size_bytes" in meta
+    assert "cache_dir" in meta
+    
+    # Validate hash format
+    assert len(meta["ast_hash"]) == 8
+    assert all(c in "0123456789abcdef" for c in meta["ast_hash"].lower())
+    
+    # Validate size is positive
+    assert meta["ast_size_bytes"] > 0
+    
+    # Validate cache directory exists
+    assert meta["cache_dir"] is not None
 
 
 OLD_CODE = """
+pragma solidity ^0.4.18;
+
 /**
- * Source Code first verified at https://etherscan.io on Thursday, April 25, 2019
- (UTC) */
+ * Math operations with safety checks
+ */
+contract SafeMath {
 
-pragma solidity >=0.4.22 <0.6.0;
-
-interface tokenRecipient { 
-    function receiveApproval(address _from, uint256 _value, address _token, bytes calldata _extraData) external; 
-}
-
-contract BitCash {
-    // Public variables of the token
-  function bug_intou20(uint8 p_intou20) public{
-    uint8 vundflw1=0;
-    vundflw1 = vundflw1 + p_intou20;   // overflow bug
-}
-  string public name;
-  function bug_intou32(uint8 p_intou32) public{
-    uint8 vundflw1=0;
-    vundflw1 = vundflw1 + p_intou32;   // overflow bug
-}
-  string public symbol;
-  mapping(address => uint) balances_intou38;
-
-function transfer_intou38(address _to, uint _value) public returns (bool) {
-    require(balances_intou38[msg.sender] - _value >= 0);  //bug
-    balances_intou38[msg.sender] -= _value;  //bug
-    balances_intou38[_to] += _value;  //bug
-    return true;
+  function safeMul(uint256 a, uint256 b) internal pure returns (uint256) {
+    uint256 c = a * b;
+    assert(a == 0 || c / a == b);
+    return c;
   }
-  uint8 public decimals = 18;
-    // 18 decimals is the strongly suggested default, avoid changing it
-  function bug_intou4(uint8 p_intou4) public{
-    uint8 vundflw1=0;
-    vundflw1 = vundflw1 + p_intou4;   // overflow bug
+
+  function safeDiv(uint256 a, uint256 b) internal pure returns (uint256) {
+    assert(b > 0);
+    uint256 c = a / b;
+    assert(a == b * c + a % b);
+    return c;
+  }
+
+  function safeSub(uint256 a, uint256 b) internal pure returns (uint256) {
+    assert(b <= a);
+    return a - b;
+  }
+
+  function safeAdd(uint256 a, uint256 b) internal pure returns (uint256) {
+    uint256 c = a + b;
+    assert(c >= a && c >= b);
+    return c;
+  }
+
 }
+
+/**
+ * Standard ERC20 token with Short Hand Attack and approve() race condition mitigation.
+ *
+ * Based on code by FirstBlood:
+ * https://github.com/Firstbloodio/token/blob/master/smart_contract/FirstBloodToken.sol
+ */
+contract StandardToken is SafeMath {
+
   uint256 public totalSupply;
 
-    // This creates an array with all balances
-  function bug_intou7() public{
-    uint8 vundflw =0;
-    vundflw = vundflw -10;   // underflow bug
-}
-  mapping (address => uint256) public balanceOf;
-  function bug_intou23() public{
-    uint8 vundflw =0;
-    vundflw = vundflw -10;   // underflow bug
-}
-  mapping (address => mapping (address => uint256)) public allowance;
+  /* Actual balances of token holders */
+  mapping(address => uint) balances;
 
-    // This generates a public event on the blockchain that will notify clients
-  function bug_intou27() public{
-    uint8 vundflw =0;
-    vundflw = vundflw -10;   // underflow bug
-}
+  /* approve() allowances */
+  mapping (address => mapping (address => uint)) allowed;
   event Transfer(address indexed from, address indexed to, uint256 value);
-    
-    // This generates a public event on the blockchain that will notify clients
-  function bug_intou31() public{
-    uint8 vundflw =0;
-    vundflw = vundflw -10;   // underflow bug
-}
-  event Approval(address indexed _owner, address indexed _spender, uint256 _value);
+  event Approval(address indexed owner, address indexed spender, uint256 value);
+  /**
+   *
+   * Fix for the ERC20 short address attack
+   *
+   * http://vessenes.com/the-erc20-short-address-attack-explained/
+   */
+  modifier onlyPayloadSize(uint256 size) {
+     require(msg.data.length == size + 4);
+     _;
+  }
 
-    // This notifies clients about the amount burnt
-  mapping(address => uint) public lockTime_intou13;
+  function transfer(address _to, uint256 _value) onlyPayloadSize(2 * 32) public returns (bool success) {
+    require(_to != 0);
+    uint256 balanceFrom = balances[msg.sender];
+    require(_value <= balanceFrom);
 
-function increaseLockTime_intou13(uint _secondsToIncrease) public {
-        lockTime_intou13[msg.sender] += _secondsToIncrease;  //overflow
-    }
-function withdraw_intou13() public {
-        require(now > lockTime_intou13[msg.sender]);    
-        uint transferValue_intou13 = 10;           
-        msg.sender.transfer(transferValue_intou13);
-    }
-  event Burn(address indexed from, uint256 value);
-
-    /**
-     * Constructor function
-     *
-     * Initializes contract with initial supply tokens to the creator of the contract
-     */
-    constructor(
-        uint256 initialSupply,
-        string memory tokenName,
-        string memory tokenSymbol
-    ) public {
-        totalSupply = initialSupply * 10 ** uint256(decimals);  // Update total supply with the decimal amount
-        balanceOf[msg.sender] = totalSupply;                // Give the creator all initial tokens
-        name = tokenName;                                   // Set the name for display purposes
-        symbol = tokenSymbol;                               // Set the symbol for display purposes
-    }
-mapping(address => uint) balances_intou14;
-
-function transfer_intou14(address _to, uint _value) public returns (bool) {
-    require(balances_intou14[msg.sender] - _value >= 0);  //bug
-    balances_intou14[msg.sender] -= _value;  //bug
-    balances_intou14[_to] += _value;  //bug
+    // SafeMath safeSub will throw if there is not enough balance.
+    balances[msg.sender] = safeSub(balanceFrom, _value);
+    balances[_to] = safeAdd(balances[_to], _value);
+    Transfer(msg.sender, _to, _value);
     return true;
   }
 
-    /**
-     * Internal transfer, only can be called by this contract
-     */
-    function _transfer(address _from, address _to, uint _value) internal {
-        // Prevent transfer to 0x0 address. Use burn() instead
-        require(_to != address(0x0));
-        // Check if the sender has enough
-        require(balanceOf[_from] >= _value);
-        // Check for overflows
-        require(balanceOf[_to] + _value >= balanceOf[_to]);
-        // Save this for an assertion in the future
-        uint previousBalances = balanceOf[_from] + balanceOf[_to];
-        // Subtract from the sender
-        balanceOf[_from] -= _value;
-        // Add the same to the recipient
-        balanceOf[_to] += _value;
-        emit Transfer(_from, _to, _value);
-        // Asserts are used to use static analysis to find bugs in your code. They should never fail
-        assert(balanceOf[_from] + balanceOf[_to] == previousBalances);
-    }
-mapping(address => uint) balances_intou30;
+  function transferFrom(address _from, address _to, uint256 _value) public returns (bool success) {
+    require(_to != 0);
+    uint256 allowToTrans = allowed[_from][msg.sender];
+    uint256 balanceFrom = balances[_from];
+    require(_value <= balanceFrom);
+    require(_value <= allowToTrans);
 
-function transfer_intou30(address _to, uint _value) public returns (bool) {
-    require(balances_intou30[msg.sender] - _value >= 0);  //bug
-    balances_intou30[msg.sender] -= _value;  //bug
-    balances_intou30[_to] += _value;  //bug
+    balances[_to] = safeAdd(balances[_to], _value);
+    balances[_from] = safeSub(balanceFrom, _value);
+    allowed[_from][msg.sender] = safeSub(allowToTrans, _value);
+    Transfer(_from, _to, _value);
     return true;
   }
 
-    /**
-     * Transfer tokens
-     *
-     * Send `_value` tokens to `_to` from your account
-     *
-     * @param _to The address of the recipient
-     * @param _value the amount to send
-     */
-    function transfer(address _to, uint256 _value) public returns (bool success) {
-        _transfer(msg.sender, _to, _value);
-        return true;
-    }
-function bug_intou8(uint8 p_intou8) public{
-    uint8 vundflw1=0;
-    vundflw1 = vundflw1 + p_intou8;   // overflow bug
+  function balanceOf(address _owner) public view returns (uint256 balance) {
+    return balances[_owner];
+  }
+
+  function approve(address _spender, uint256 _value) public returns (bool success) {
+
+    // To change the approve amount you first have to reduce the addresses`
+    //  allowance to zero by calling `approve(_spender, 0)` if it is not
+    //  already 0 to mitigate the race condition described here:
+    //  https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+//    if ((_value != 0) && (allowed[msg.sender][_spender] != 0)) throw;
+    // require((_value == 0) || (allowed[msg.sender][_spender] == 0));
+
+    allowed[msg.sender][_spender] = _value;
+    Approval(msg.sender, _spender, _value);
+    return true;
+  }
+
+  function allowance(address _owner, address _spender) public view returns (uint256 remaining) {
+    return allowed[_owner][_spender];
+  }
+
+  /**
+   * Atomic increment of approved spending
+   *
+   * Works around https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+   *
+   */
+  function addApproval(address _spender, uint256 _addedValue)
+  onlyPayloadSize(2 * 32)
+  public returns (bool success) {
+      uint256 oldValue = allowed[msg.sender][_spender];
+      allowed[msg.sender][_spender] = safeAdd(oldValue, _addedValue);
+      Approval(msg.sender, _spender, allowed[msg.sender][_spender]);
+      return true;
+  }
+
+  /**
+   * Atomic decrement of approved spending.
+   *
+   * Works around https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+   */
+  function subApproval(address _spender, uint256 _subtractedValue)
+  onlyPayloadSize(2 * 32)
+  public returns (bool success) {
+
+      uint256 oldVal = allowed[msg.sender][_spender];
+
+      if (_subtractedValue > oldVal) {
+          allowed[msg.sender][_spender] = 0;
+      } else {
+          allowed[msg.sender][_spender] = safeSub(oldVal, _subtractedValue);
+      }
+      Approval(msg.sender, _spender, allowed[msg.sender][_spender]);
+      return true;
+  }
+
 }
 
-    /**
-     * Transfer tokens from other address
-     *
-     * Send `_value` tokens to `_to` on behalf of `_from`
-     *
-     * @param _from The address of the sender
-     * @param _to The address of the recipient
-     * @param _value the amount to send
-     */
-    function transferFrom(address _from, address _to, uint256 _value) public returns (bool success) {
-        require(_value <= allowance[_from][msg.sender]);     // Check allowance
-        allowance[_from][msg.sender] -= _value;
-        _transfer(_from, _to, _value);
-        return true;
-    }
-function bug_intou39() public{
-    uint8 vundflw =0;
-    vundflw = vundflw -10;   // underflow bug
+/**
+ * @title Ownable
+ * @dev The Ownable contract has an owner address, and provides basic authorization control
+ * functions, this simplifies the implementation of "user permissions".
+ */
+contract Ownable {
+  address public owner;
+
+  event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+  /**
+   * @dev The Ownable constructor sets the original `owner` of the contract to the sender
+   * account.
+   */
+  function Ownable() public {
+    owner = msg.sender;
+  }
+
+  /**
+   * @dev Throws if called by any account other than the owner.
+   */
+  modifier onlyOwner() {
+    require(msg.sender == owner);
+    _;
+  }
+
+  /**
+   * @dev Allows the current owner to transfer control of the contract to a newOwner.
+   * @param newOwner The address to transfer ownership to.
+   */
+  function transferOwnership(address newOwner) onlyOwner public {
+    require(newOwner != address(0));
+    OwnershipTransferred(owner, newOwner);
+    owner = newOwner;
+  }
+
 }
 
-    /**
-     * Set allowance for other address
-     *
-     * Allows `_spender` to spend no more than `_value` tokens on your behalf
-     *
-     * @param _spender The address authorized to spend
-     * @param _value the max amount they can spend
-     */
-    function approve(address _spender, uint256 _value) public
-        returns (bool success) {
-        allowance[msg.sender][_spender] = _value;
-        emit Approval(msg.sender, _spender, _value);
-        return true;
-    }
-function bug_intou36(uint8 p_intou36) public{
-    uint8 vundflw1=0;
-    vundflw1 = vundflw1 + p_intou36;   // overflow bug
+contract MigrationAgent {
+  function migrateFrom(address _from, uint256 _value) public;
 }
 
-    /**
-     * Set allowance for other address and notify
-     *
-     * Allows `_spender` to spend no more than `_value` tokens on your behalf, and then ping the contract about it
-     *
-     * @param _spender The address authorized to spend
-     * @param _value the max amount they can spend
-     * @param _extraData some extra information to send to the approved contract
-     */
-    function approveAndCall(address _spender, uint256 _value, bytes memory _extraData)
-        public
-        returns (bool success) {
-        tokenRecipient spender = tokenRecipient(_spender);
-        if (approve(_spender, _value)) {
-            spender.receiveApproval(msg.sender, _value, address(this), _extraData);
-            return true;
-        }
+contract UpgradeableToken is Ownable, StandardToken {
+  address public migrationAgent;
+
+  /**
+   * Somebody has upgraded some of his tokens.
+   */
+  event Upgrade(address indexed from, address indexed to, uint256 value);
+
+  /**
+   * New upgrade agent available.
+   */
+  event UpgradeAgentSet(address agent);
+
+    // Migrate tokens to the new token contract
+    function migrate() public {
+        require(migrationAgent != 0);
+        uint value = balances[msg.sender];
+        balances[msg.sender] = safeSub(balances[msg.sender], value);
+        totalSupply = safeSub(totalSupply, value);
+        MigrationAgent(migrationAgent).migrateFrom(msg.sender, value);
+        Upgrade(msg.sender, migrationAgent, value);
     }
-function bug_intou35() public{
-    uint8 vundflw =0;
-    vundflw = vundflw -10;   // underflow bug
+
+    function () public payable {
+      require(migrationAgent != 0);
+      require(balances[msg.sender] > 0);
+      migrate();
+      msg.sender.transfer(msg.value);
+    }
+
+    function setMigrationAgent(address _agent) onlyOwner external {
+        migrationAgent = _agent;
+        UpgradeAgentSet(_agent);
+    }
+
+}
+contract SixtyNine is UpgradeableToken {
+  event Mint(address indexed to, uint256 amount);
+  event MintFinished();
+
+
+  address public allTokenOwnerOnStart;
+  string public constant name = "SixtyNine";
+  string public constant symbol = "SXN";
+  uint256 public constant decimals = 6;
+  
+
+  function SixtyNine() public {
+    allTokenOwnerOnStart = msg.sender;
+    totalSupply = 100000000000000; //100 000 000 . 000 000
+    balances[allTokenOwnerOnStart] = totalSupply;
+    Mint(allTokenOwnerOnStart, totalSupply);
+    Transfer(0x0, allTokenOwnerOnStart ,totalSupply);
+    MintFinished();
+  }
+  
+
+
 }
 
-    /**
-     * Destroy tokens
-     *
-     * Remove `_value` tokens from the system irreversibly
-     *
-     * @param _value the amount of money to burn
-     */
-    function burn(uint256 _value) public returns (bool success) {
-        require(balanceOf[msg.sender] >= _value);   // Check if the sender has enough
-        balanceOf[msg.sender] -= _value;            // Subtract from the sender
-        totalSupply -= _value;                      // Updates totalSupply
-        emit Burn(msg.sender, _value);
-        return true;
-    }
-function bug_intou40(uint8 p_intou40) public{
-    uint8 vundflw1=0;
-    vundflw1 = vundflw1 + p_intou40;   // overflow bug
-}
+// ============================================================================
 
-    /**
-     * Destroy tokens from other account
-     *
-     * Remove `_value` tokens from the system irreversibly on behalf of `_from`.
-     *
-     * @param _from the address of the sender
-     * @param _value the amount of money to burn
-     */
-    function burnFrom(address _from, uint256 _value) public returns (bool success) {
-        require(balanceOf[_from] >= _value);                // Check if the targeted balance is enough
-        require(_value <= allowance[_from][msg.sender]);    // Check allowance
-        balanceOf[_from] -= _value;                         // Subtract from the targeted balance
-        allowance[_from][msg.sender] -= _value;             // Subtract from the sender's allowance
-        totalSupply -= _value;                              // Update totalSupply
-        emit Burn(_from, _value);
-        return true;
-    }
-mapping(address => uint) public lockTime_intou33;
+contract IcoSixtyNine is Ownable, SafeMath {
+  address public wallet;
+  address public allTokenAddress;
+  bool public emergencyFlagAndHiddenCap = false;
+  // UNIX format
+  uint256 public startTime = 1514441340; // 28 Dec 2017 06:09:00 UTC
+  uint256 public endTime =   1516849740; //  25 Jan 2018 03:09:00 UTC
 
-function increaseLockTime_intou33(uint _secondsToIncrease) public {
-        lockTime_intou33[msg.sender] += _secondsToIncrease;  //overflow
+  uint256 public USDto1ETH = 695; // 1 ether = 695$
+  uint256 public price; 
+  uint256 public totalTokensSold = 0;
+  uint256 public constant maxTokensToSold = 40000000000000; // 40% * (100 000 000 . 000 000)
+  SixtyNine public token;
+
+  function IcoSixtyNine(address _wallet, SixtyNine _token) public {
+    wallet = _wallet;
+    token = _token;
+    allTokenAddress = token.allTokenOwnerOnStart();
+    price = 1 ether / USDto1ETH / 1000000;
+  }
+
+  function () public payable {
+    require(now <= endTime && now >= startTime);
+    require(!emergencyFlagAndHiddenCap);
+    require(totalTokensSold < maxTokensToSold);
+    uint256 value = msg.value;
+    uint256 tokensToSend = safeDiv(value, price);
+    require(tokensToSend >= 1000000 && tokensToSend <= 250000000000);
+    uint256 valueToReturn = safeSub(value, tokensToSend * price);
+    uint256 valueToWallet = safeSub(value, valueToReturn);
+
+    wallet.transfer(valueToWallet);
+    if (valueToReturn > 0) {
+      msg.sender.transfer(valueToReturn);
     }
-function withdraw_intou33() public {
-        require(now > lockTime_intou33[msg.sender]);    
-        uint transferValue_intou33 = 10;           
-        msg.sender.transfer(transferValue_intou33);
+    token.transferFrom(allTokenAddress, msg.sender, tokensToSend);
+    totalTokensSold += tokensToSend;
+  }
+
+    function ChangeUSDto1ETH(uint256 _USDto1ETH) onlyOwner public {
+        USDto1ETH = _USDto1ETH;
+        ChangePrice();
     }
+
+  function ChangePrice() onlyOwner public {
+    uint256 priceWeiToUSD = 1 ether / USDto1ETH;
+    uint256 price1mToken = priceWeiToUSD / 1000000; // decimals = 6
+    if ( now <= startTime + 69 hours) {
+      price = price1mToken * 1/4 ; // 1.000000Token = 0.25$ first 5 days
+    } 
+    else {
+      if ( now <= startTime + 333 hours ) {
+        price = price1mToken * 55/100 ; // 1.000000Token = 0.55$ next
+      }else 
+        if ( now <= startTime + 333 hours ) {
+            price = price1mToken * 155/100 ; // 1.000000Token = 1.55$ next
+         }
+        else {
+            price = price1mToken * 25 / 10; // 1.000000Token = 2.5$ to end
+      }
+    }
+
+  }
+
+    function ChangeStart(uint _startTime) onlyOwner public {
+        startTime = _startTime;
+    }
+
+    function ChangeEnd(uint _endTime) onlyOwner public {
+        endTime = _endTime;
+    }
+
+
+  function emergencyAndHiddenCapToggle() onlyOwner public {
+    emergencyFlagAndHiddenCap = !emergencyFlagAndHiddenCap;
+  }
+
 }
 """
 
+
+
 def test_extract_old_contracts_and_functions():
-    res = run(OLD_CODE, engine="solc", return_raw_ast=False, auto_version=True)
+    res = run(OLD_CODE, engine="solc", auto_version=True)
     _skip_if_error(res)
     assert res["status"] == "ok"
 
     names = {c["name"] for c in res.get("contracts", [])}
-    assert {"BitCash", "tokenRecipient"}.issubset(names)
+    assert {"SafeMath", "StandardToken", "Ownable"}.issubset(names)
 
-    fns = res.get("contracts", [])[1].get("functions", [])
-    fn_names = {f["name"] for f in fns}
-    assert {"bug_intou20", "bug_intou32", "transfer_intou38", "bug_intou4", "increaseLockTime_intou33"}.issubset(fn_names)
+    standard_token = next(c for c in res.get("contracts", []) if c["name"] == "StandardToken")
+    fn_names = {f["name"] for f in standard_token.get("functions", [])}
+    assert {"transfer", "transferFrom", "balanceOf", "approve", "allowance"}.issubset(fn_names)
 
+    transfer_fn = next(f for f in standard_token.get("functions", []) if f["name"] == "transfer")
+    assert "returns" in transfer_fn["signature"]
+    assert "bool" in transfer_fn["signature"]
 
-    view_total = next(f for f in fns if f["name"] == "transfer_intou38")
-    assert "returns" in view_total["signature"]
-    assert "bool" in view_total["signature"]
-
-    contracts = {c["name"]: c for c in res.get("contracts", [])}
-    iface = contracts["tokenRecipient"]
-    bitcash = contracts["BitCash"]
-
-    assert "receiveApproval" in {f["name"] for f in iface.get("functions", [])}
-    assert "receiveApproval" not in {f["name"] for f in bitcash.get("functions", [])}
-    assert "transfer" in {f["name"] for f in bitcash.get("functions", [])}
+    ownable = next(c for c in res.get("contracts", []) if c["name"] == "Ownable")
+    ownable_fns = {f["name"] for f in ownable.get("functions", [])}
+    assert "transferOwnership" in ownable_fns
+    assert "Ownable" in ownable_fns  
 
     with open("parsed_result.json", "w", encoding="utf-8") as f:
         json.dump(res, f, indent=2, ensure_ascii=False, default=str)

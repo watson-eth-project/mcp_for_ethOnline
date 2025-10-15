@@ -11,6 +11,7 @@ import sys
 import threading
 from pathlib import Path
 from typing import Any, Dict, List, Literal, TypedDict
+import shutil
 
 from solcx import (
     install_solc,
@@ -200,7 +201,6 @@ def run(
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
-                    timeout=timeout_seconds,
                     bufsize=1,  
                     env=env,
                 )
