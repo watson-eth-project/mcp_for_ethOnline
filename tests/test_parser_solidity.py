@@ -1,6 +1,7 @@
 import pytest
 import json
-from mcp_modules.parser_solidity import run, _ensure_solc_auto_by_pragma
+from mcp_modules.parser_solidity import run
+from mcp_modules.common.normalize import ensure_solc_auto_by_pragma
 
 SIMPLE_CODE = """
 // SPDX-License-Identifier: MIT

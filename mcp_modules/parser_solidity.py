@@ -11,12 +11,25 @@ try:
 except ImportError:
     PLATFORMDIRS_AVAILABLE = False
 
-from solcx import (
-    compile_standard,
-    install_solc,
-    set_solc_version,
-    get_installed_solc_versions,
-    install_solc_pragma         
+from solcx import compile_standard
+from .common.normalize import (
+    extract_pragma,
+    ensure_solc_auto_by_pragma,
+    ensure_solc,
+    string_or_none,
+    src_span,
+    line_from_offset,
+    node_kind,
+    iter_nodes,
+)
+
+from .common.errors import (
+    ErrorHandler,
+    ErrorCode,
+    empty_input_error,
+    engine_not_implemented_error,
+    solc_install_failed_error,
+    solc_not_installed_error
 )
 
 Engine = Literal["treesitter", "solc"]
@@ -27,16 +40,10 @@ class ParserSolidityResult(TypedDict, total=False):
     warnings: List[str]
     errors: List[str]
     meta: Dict[str, Any]
-    ast_uri: str  # URI to cached AST
+    ast_uri: str  
     functions: List[Dict[str, Any]]
     contracts: List[Dict[str, Any]]
 
-def _extract_pragma(input_code: str) -> str | None:
-    """Extract pragma directive from Solidity code."""
-    pragma_match = re.search(r'pragma\s+solidity\s+([^;]+);', input_code, re.IGNORECASE)
-    if pragma_match:
-        return pragma_match.group(1).strip()
-    return None
 
 def _get_ast_cache_dir(custom_dir: str | None = None) -> Path:
     """Get AST cache directory using platformdirs or custom path."""
@@ -51,99 +58,107 @@ def _get_ast_cache_dir(custom_dir: str | None = None) -> Path:
     cache_dir.mkdir(parents=True, exist_ok=True)
     return cache_dir
 
-def _ensure_solc_auto_by_pragma(input_code: str, fallback_version: str | None = "0.8.26") -> str:
-    """Check we have solc version installed by pragma"""
 
-    # Extract pragma to see what version we're looking for
-    pragma = _extract_pragma(input_code)
+
+
+def _compile_to_ast_with_solc(input_code: str | Dict[str, str], solc_version: str) -> Dict[str, Any]:
+    """Compile to AST with solc, supporting both single file and multiple files."""
     
-    try:
-        ver = install_solc_pragma(pragma)  
-        if ver:
-            set_solc_version(str(ver))
-            return ver
-    except Exception:
-        pass
-
-    if fallback_version:
-        _ensure_solc(fallback_version)
-        return fallback_version
-    raise RuntimeError("SolcNotInstalled")
-
-def _ensure_solc(solc_version: str) -> None:
-    """Check we have solc version installed by solc_version"""
-    
-    installed = {str(v) for v in get_installed_solc_versions()}
-    if solc_version not in installed:
-        install_solc(solc_version)
-    set_solc_version(solc_version)
-
-
-def _compile_to_ast_with_solc(input_code: str, solc_version: str) -> Dict[str, Any]:
-    """Compile to AST with solc"""
+    if isinstance(input_code, str):
+        # Single file mode (backward compatibility)
+        sources = {"Contract.sol": {"content": input_code}}
+        source_list = ["Contract.sol"]
+    else:
+        # Multiple files mode
+        sources = {filename: {"content": content} for filename, content in input_code.items()}
+        source_list = list(input_code.keys())
     
     std_input = {
         "language": "Solidity",
-        "sources": {"Contract.sol": {"content": input_code}},
+        "sources": sources,
         "settings": {
             "outputSelection": {"*": {"": ["ast", "legacyAST"]}},
         },
     }
     out = compile_standard(std_input, allow_paths=".")
-    src = out.get("sources", {}).get("Contract.sol", {})
-
-    #Get AST safely
-    ast = src.get("ast") or src.get("legacyAST")
-    if not ast:
-        ast = out.get("ast") or out
-
+    
+    # For multiple files, we need to merge ASTs or return the main compilation result
+    if len(source_list) == 1:
+        # Single file - get AST from the source
+        src = out.get("sources", {}).get(source_list[0], {})
+        ast = src.get("ast") or src.get("legacyAST")
+        if not ast:
+            ast = out.get("ast") or out
+    else:
+        # Multiple files - return the full compilation result
+        ast = out
+    
     return ast
 
 
-def _node_kind(node: Dict[str, Any]) -> str:
-    return node.get("nodeType") or node.get("name") or ""
 
 
-def _iter_nodes(node: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Children of the node (uniformly for legacyAST)."""
-    if "nodes" in node and isinstance(node["nodes"], list):
-        return node["nodes"]
+def _create_src_mapping(compilation_result: Dict[str, Any], source_list: List[str]) -> Dict[str, Dict[str, Any]]:
+    """
+    Create mapping from src strings to (filename, start, length) for accurate positioning.
+    Returns dict with src as key and {"filename": str, "start": int, "length": int} as value.
+    """
+    src_mapping = {}
+    
+    # For single file, use the source name
+    if len(source_list) == 1:
+        filename = source_list[0]
+        sources = compilation_result.get("sources", {})
+        if filename in sources:
+            src_ast = sources[filename].get("ast") or sources[filename].get("legacyAST")
+            if src_ast:
+                _extract_src_from_ast(src_ast, filename, src_mapping)
+    else:
+        # For multiple files, process each source
+        sources = compilation_result.get("sources", {})
+        for filename in source_list:
+            if filename in sources:
+                src_ast = sources[filename].get("ast") or sources[filename].get("legacyAST")
+                if src_ast:
+                    _extract_src_from_ast(src_ast, filename, src_mapping)
+    
+    return src_mapping
 
-    if "children" in node and isinstance(node["children"], list):
-        return node["children"]
-    return []
+def _extract_src_from_ast(node: Dict[str, Any], filename: str, src_mapping: Dict[str, Dict[str, Any]]) -> None:
+    """Recursively extract src mappings from AST nodes."""
+    if isinstance(node, dict):
+        src = node.get("src")
+        if src and isinstance(src, str):
+            try:
+                # Parse src format: "start:length:file_id"
+                parts = src.split(":")
+                if len(parts) >= 2:
+                    start = int(parts[0])
+                    length = int(parts[1])
+                    src_mapping[src] = {
+                        "filename": filename,
+                        "start": start,
+                        "length": length
+                    }
+            except (ValueError, IndexError):
+                pass
+        
+        # Recursively process children
+        for value in node.values():
+            if isinstance(value, (dict, list)):
+                _extract_src_from_ast(value, filename, src_mapping)
+    
+    elif isinstance(node, list):
+        for item in node:
+            if isinstance(item, (dict, list)):
+                _extract_src_from_ast(item, filename, src_mapping)
 
-
-def _string_or_none(v: Any) -> Optional[str]:
-    return v if isinstance(v, str) else None
-
-
-def _src_span(node: Dict[str, Any]) -> Dict[str, int | None]:
-    s = node.get("src")
-    if not isinstance(s, str) or ":" not in s:
-        return {"offsetStart": None, "offsetEnd": None}
-    try:
-        start_str, length_str, _ = s.split(":")
-        start = int(start_str); length = int(length_str)
-        return {"offsetStart": start, "offsetEnd": start + length}
-    except Exception:
-        return {"offsetStart": None, "offsetEnd": None}
-
-def _line_from_offset(source: str, offset: int | None) -> int | None:
-    if offset is None or offset < 0:
-        return None
-    try:
-        return source[:offset].count("\n") + 1
-    except Exception:
-        return None
-
-
-def _extract_contracts_with_members(ast: Dict[str, Any], source_text: str) -> List[Dict[str, Any]]:
+def _extract_contracts_with_members(ast: Dict[str, Any], source_text: str | Dict[str, str]) -> List[Dict[str, Any]]:
     contracts: List[Dict[str, Any]] = []
 
     def _extract_contract_header(node: Dict[str, Any]) -> Dict[str, Any]:
-        kind = _string_or_none(node.get("contractKind")) or "contract"
-        name = _string_or_none(node.get("name")) or ""
+        kind = string_or_none(node.get("contractKind")) or "contract"
+        name = string_or_none(node.get("name")) or ""
         bases: List[str] = []
         for b in node.get("baseContracts", []) or []:
             bn = b.get("baseName", {}).get("name")
@@ -152,7 +167,7 @@ def _extract_contracts_with_members(ast: Dict[str, Any], source_text: str) -> Li
         return {"name": name, "kind": kind, "bases": bases}
 
     def walk(node: Dict[str, Any]) -> None:
-        if _node_kind(node) == "ContractDefinition":
+        if node_kind(node) == "ContractDefinition":
             header = _extract_contract_header(node)
             members = _collect_from_contract(node, source_text)
             contracts.append(
@@ -165,15 +180,13 @@ def _extract_contracts_with_members(ast: Dict[str, Any], source_text: str) -> Li
                     "enums": members["enums"],
                 }
             )
-            # Не идём внутрь этого узла дальше, так как _collect_from_contract уже прошёл его детей
             return
 
-        for ch in _iter_nodes(node):
+        for ch in iter_nodes(node):
             walk(ch)
 
     walk(ast)
 
-    # Убираем возможные дубликаты по (name, kind) сохраняя последний вариант
     uniq: Dict[tuple, Dict[str, Any]] = {}
     for c in contracts:
         uniq[(c["name"], c["kind"])] = c
@@ -194,21 +207,21 @@ def _params_list(param_list_node: Dict[str, Any]) -> List[Dict[str, Any]]:
             typ = p.get("typeDescriptions", {}).get("typeString") or p.get("typeName", {}).get("name") or "unknown"
             res.append(
                 {
-                    "name": _string_or_none(p.get("name")) or "",
+                    "name": string_or_none(p.get("name")) or "",
                     "type": typ,
                 }
             )
         return res
 
-    for ch in _iter_nodes(param_list_node):
-        if _node_kind(ch) == "VariableDeclaration":
+    for ch in iter_nodes(param_list_node):
+        if node_kind(ch) == "VariableDeclaration":
             typ = (
                 ch.get("typeDescriptions", {}).get("typeString")
                 or ch.get("attributes", {}).get("type")
                 or ch.get("typeName", {}).get("name")
                 or "unknown"
             )
-            res.append({"name": _string_or_none(ch.get("name")) or "", "type": typ})
+            res.append({"name": string_or_none(ch.get("name")) or "", "type": typ})
     return res
 
 
@@ -220,22 +233,22 @@ def _func_signature(name: str, inputs: List[Dict[str, Any]], returns: List[Dict[
     return f"{name}({ins})"
 
 
-def _collect_from_contract(contract_node: Dict[str, Any], source_text: str) -> Dict[str, List[Dict[str, Any]]]:
+def _collect_from_contract(contract_node: Dict[str, Any], source_text: str | Dict[str, str]) -> Dict[str, List[Dict[str, Any]]]:
     functions: List[Dict[str, Any]] = []
     modifiers_decl: List[Dict[str, Any]] = []
     events: List[Dict[str, Any]] = []
     structs: List[Dict[str, Any]] = []
     enums: List[Dict[str, Any]] = []
 
-    for ch in _iter_nodes(contract_node):
-        kind = _node_kind(ch)
+    for ch in iter_nodes(contract_node):
+        kind = node_kind(ch)
 
         if kind == "FunctionDefinition":
             fn_src = ch.get("src")
-            fn_name = _string_or_none(ch.get("name")) or ""
-            fn_kind = _string_or_none(ch.get("kind")) or "function"
-            visibility = _string_or_none(ch.get("visibility")) or "public"
-            state_mut = _string_or_none(ch.get("stateMutability")) or "nonpayable"
+            fn_name = string_or_none(ch.get("name")) or ""
+            fn_kind = string_or_none(ch.get("kind")) or "function"
+            visibility = string_or_none(ch.get("visibility")) or "public"
+            state_mut = string_or_none(ch.get("stateMutability")) or "nonpayable"
 
             inputs = _params_list(ch.get("parameters") or ch.get("parametersList") or {})
             returns = _params_list(ch.get("returnParameters") or ch.get("returnParametersList") or {})
@@ -256,8 +269,8 @@ def _collect_from_contract(contract_node: Dict[str, Any], source_text: str) -> D
 
             display_name = fn_name or fn_kind
 
-            pos = _src_span(ch)
-            start_line = _line_from_offset(source_text, pos["offsetStart"])
+            pos = src_span(ch)
+            start_line = line_from_offset(source_text, pos["offsetStart"])
 
             functions.append(
                 {
@@ -284,7 +297,7 @@ def _collect_from_contract(contract_node: Dict[str, Any], source_text: str) -> D
         elif kind == "ModifierDefinition":
             modifiers_decl.append(
                 {
-                    "name": _string_or_none(ch.get("name")) or "",
+                    "name": string_or_none(ch.get("name")) or "",
                     "parameters": _params_list(ch.get("parameters") or {}),
                 }
             )
@@ -293,30 +306,30 @@ def _collect_from_contract(contract_node: Dict[str, Any], source_text: str) -> D
             params = _params_list(ch.get("parameters") or {})
             events.append(
                 {
-                    "name": _string_or_none(ch.get("name")) or "",
+                    "name": string_or_none(ch.get("name")) or "",
                     "parameters": params,
                 }
             )
 
         elif kind == "StructDefinition":
             members: List[Dict[str, Any]] = []
-            for mem in _iter_nodes(ch):
-                if _node_kind(mem) == "VariableDeclaration":
+            for mem in iter_nodes(ch):
+                if node_kind(mem) == "VariableDeclaration":
                     typ = (
                         mem.get("typeDescriptions", {}).get("typeString")
                         or mem.get("typeName", {}).get("name")
                         or "unknown"
                     )
-                    members.append({"name": _string_or_none(mem.get("name")) or "", "type": typ})
-            structs.append({"name": _string_or_none(ch.get("name")) or "", "members": members})
+                    members.append({"name": string_or_none(mem.get("name")) or "", "type": typ})
+            structs.append({"name": string_or_none(ch.get("name")) or "", "members": members})
 
         elif kind == "EnumDefinition":
             vals: List[str] = []
-            for v in _iter_nodes(ch):
-                nm = _string_or_none(v.get("name"))
+            for v in iter_nodes(ch):
+                nm = string_or_none(v.get("name"))
                 if nm:
                     vals.append(nm)
-            enums.append({"name": _string_or_none(ch.get("name")) or "", "values": vals})
+            enums.append({"name": string_or_none(ch.get("name")) or "", "values": vals})
 
     return {
         "functions": functions,
@@ -338,7 +351,7 @@ def _save_ast(raw_ast_json: str, cache_dir: Path) -> tuple[str | None, str | Non
         return None, None, 0
 
 def run(
-    input_code: str,
+    input_code: str | Dict[str, str],
     *,
     engine: Engine = "solc",
     auto_version: bool = True,          
@@ -347,55 +360,77 @@ def run(
     ast_cache_dir: str | None = None,
 ) -> ParserSolidityResult:
     t0 = time.time()
-    if not input_code or not input_code.strip():
-        return {
-            "status": "error",
-            "module": "parser_solidity",
-            "errors": ["EmptyInput"],
-            "warnings": [],
-            "meta": {"duration_ms": int((time.time() - t0) * 1000), "engine": engine, "solc_version": solc_version},
-        }
+    
+    # Handle input validation for both single file and multiple files
+    if isinstance(input_code, str):
+        if not input_code or not input_code.strip():
+            return empty_input_error(
+                duration_ms=int((time.time() - t0) * 1000),
+                engine=engine,
+                solc_version=solc_version
+            )
+        source_list = ["Contract.sol"]
+    else:
+        if not input_code or not any(content.strip() for content in input_code.values()):
+            return empty_input_error(
+                duration_ms=int((time.time() - t0) * 1000),
+                engine=engine,
+                solc_version=solc_version
+            )
+        source_list = list(input_code.keys())
 
     if engine != "solc":
-        return {
-            "status": "error",
-            "module": "parser_solidity",
-            "errors": [f"EngineNotImplemented:{engine}"],
-            "warnings": [],
-            "meta": {"duration_ms": int((time.time() - t0) * 1000)},
-        }
+        return engine_not_implemented_error(
+            engine=engine,
+            duration_ms=int((time.time() - t0) * 1000)
+        )
 
     try:
         steps = []
         
         if auto_version:
-            chosen = _ensure_solc_auto_by_pragma(input_code, fallback_version=solc_version or "0.8.26")
+            chosen = ensure_solc_auto_by_pragma(input_code, fallback_version=solc_version or "0.8.26")
         else:
             chosen = solc_version or "0.8.26"
-            _ensure_solc(chosen)
+            ensure_solc(chosen)
         
         steps.append({"step": "picked_solc", "value": str(chosen)})
 
         ast = _compile_to_ast_with_solc(input_code, solc_version=chosen)
         steps.append({"step": "compiled", "ok": True})
         
-        payload =  {
-            "contracts":  _extract_contracts_with_members(ast, input_code)
+        # Create src mapping for accurate positioning
+        src_mapping = _create_src_mapping(ast, source_list)
+        
+        contracts = _extract_contracts_with_members(ast, input_code)
+
+        payload = {
+            "contracts": contracts
         }
 
-        # Extract pragma for metadata
-        pragma = _extract_pragma(input_code)
+        # Extract pragma for metadata (from first file)
+        if isinstance(input_code, str):
+            pragma = extract_pragma(input_code)
+        else:
+            # For multiple files, extract pragma from the first file
+            first_file_content = next(iter(input_code.values()))
+            pragma = extract_pragma(first_file_content)
 
+        elapsed_ms = int((time.time() - t0) * 1000)
         result: ParserSolidityResult = {
             "status": "ok",
             "module": "parser_solidity",
             "warnings": [],
             "errors": [],
+            "elapsed_ms": elapsed_ms,
+            "truncated": False,
             "meta": {
-                "duration_ms": int((time.time() - t0) * 1000),
+                "duration_ms": elapsed_ms,
                 "engine": engine,
                 "solc_version": str(chosen),
                 "pragma": pragma,
+                "source_list": source_list,
+                "src_mapping": src_mapping,
                 "log": steps,
             },
             **payload,
@@ -416,25 +451,32 @@ def run(
         return result
 
     except RuntimeError as e:
-        msg = str(e)
-        if msg.startswith("SolcInstallFailed"):
-            code = "SolcInstallFailed"
-        elif "SolcNotInstalled" in msg:
-            code = "SolcNotInstalled"
+        error_code = ErrorHandler.parse_runtime_error(str(e))
+        if error_code.value == "SolcInstallFailed":
+            return solc_install_failed_error(
+                version="unknown",
+                error=str(e),
+                duration_ms=int((time.time() - t0) * 1000),
+                engine=engine
+            )
+        elif error_code.value == "SolcNotInstalled":
+            return solc_not_installed_error(
+                duration_ms=int((time.time() - t0) * 1000),
+                engine=engine
+            )
         else:
-            code = "RuntimeError"
-        return {
-            "status": "error",
-            "module": "parser_solidity",
-            "errors": [code, msg],
-            "warnings": [],
-            "meta": {"duration_ms": int((time.time() - t0) * 1000), "engine": engine, "solc_version": solc_version},
-        }
+            return ErrorHandler.create_parser_error(
+                error_code,
+                message=str(e),
+                duration_ms=int((time.time() - t0) * 1000),
+                engine=engine,
+                solc_version=solc_version
+            )
     except Exception as e:
-        return {
-            "status": "error",
-            "module": "parser_solidity",
-            "errors": [type(e).__name__, str(e)],
-            "warnings": [],
-            "meta": {"duration_ms": int((time.time() - t0) * 1000), "engine": engine, "solc_version": solc_version},
-        }
+        return ErrorHandler.create_parser_error(
+            ErrorCode.RUNTIME_ERROR,
+            message=f"{type(e).__name__}: {str(e)}",
+            duration_ms=int((time.time() - t0) * 1000),
+            engine=engine,
+            solc_version=solc_version
+        )

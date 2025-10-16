@@ -13,11 +13,21 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, TypedDict
 import shutil
 
-from solcx import (
-    install_solc,
-    install_solc_pragma,
-    set_solc_version,
-    get_installed_solc_versions,
+from .common.normalize import (
+    extract_pragma,
+    detect_pragma,
+    ensure_solc_auto_by_pragma,
+    ensure_solc,
+)
+
+from .common.errors import (
+    ErrorHandler,
+    ErrorCode,
+    slither_not_found_error,
+    slither_failed_error,
+    timeout_error,
+    no_json_produced_error,
+    invalid_json_error
 )
 
 Status = Literal["ok", "error"]
@@ -34,56 +44,7 @@ class SlitherResult(TypedDict, total=False):
     raw: Dict[str, Any]
 
 
-def _err(
-    errors: List[str],
-    *,
-    t0: float,
-    input_code: str | None = None,
-    warnings_list: List[str] | None = None,
-    solc_ver: str | None = None,
-    solc_bin: str | None = None
-) -> SlitherResult:
-    return {
-        "status": "error",
-        "module": "slither_wrapper",
-        "errors": errors,
-        "warnings": (warnings_list or []),
-        "findings": [],
-        "metrics": {
-            "count": 0,
-            "solc_version": str(solc_ver) if solc_ver else None,
-            "pragma": _detect_pragma(input_code) if input_code else None,
-        },
-        "meta": {
-            "duration_ms": int((time.time() - t0) * 1000),
-            "solc_version": str(solc_ver) if solc_ver else None,
-            "solc_bin": solc_bin,
-        },
-    }
 
-def _ensure_solc_auto_by_pragma(input_code: str, fallback_version: str | None = "0.8.26") -> str:
-    """Check we have solc version installed by pragma"""
-    try:
-        ver = install_solc_pragma(input_code)  
-        if ver:
-            set_solc_version(ver)             
-            return ver
-    except Exception:
-        pass
-
-    if fallback_version:
-        _ensure_solc(fallback_version)
-        return fallback_version
-
-    raise RuntimeError("Unable to determine or install a suitable solc version.")
-
-def _ensure_solc(solc_version: str) -> None:
-    """Check we have solc version installed by solc_version"""
-    
-    installed = {str(v) for v in get_installed_solc_versions()}
-    if solc_version not in installed:
-        install_solc(solc_version)
-    set_solc_version(solc_version)
 
 def _resolve_solc_bin(version: str) -> str:
     """
@@ -100,9 +61,6 @@ def _resolve_solc_bin(version: str) -> str:
     solc_in_path = shutil.which("solc")
     return solc_in_path or "solc"
     
-def _detect_pragma(src: str) -> str | None:
-    m = re.search(r"pragma\s+solidity\s+([^;]+);", src)
-    return m.group(1).strip() if m else None
 
 def _normalize_detectors(detectors: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Normalize the Slither output to a compact list of findings."""
@@ -142,6 +100,7 @@ def _stream_pipe(pipe, prefix: str, collect: list[str]) -> None:
             collect.append(ln)
     pipe.close()
 
+
 def run(
     input_code: str,
     *,
@@ -156,7 +115,10 @@ def run(
     t0 = time.time()
     warnings: List[str] = []
     if not input_code or not input_code.strip():
-        return _err(["EmptyInput"], t0=t0, warnings_list=warnings)
+        return ErrorHandler.create_slither_error(
+            ErrorCode.EMPTY_INPUT,
+            duration_ms=int((time.time() - t0) * 1000)
+        )
       
     chosen_solc: str | None = None
 
@@ -165,10 +127,10 @@ def run(
 
     try:
         if auto_solc:
-            chosen_solc = _ensure_solc_auto_by_pragma(input_code, fallback_version=fallback_solc)
+            chosen_solc = ensure_solc_auto_by_pragma(input_code, fallback_version=fallback_solc)
         else:
             chosen_solc = fallback_solc
-            _ensure_solc(chosen_solc)
+            ensure_solc(chosen_solc)
 
         solc_bin = _resolve_solc_bin(chosen_solc)
 
@@ -220,7 +182,11 @@ def run(
                         pass
                     t_out.join(timeout=1)
                     t_err.join(timeout=1)
-                    return _err(["Timeout"], t0=t0, input_code=input_code, warnings_list=warnings, solc_ver=chosen_solc)
+                    return timeout_error(
+                        duration_ms=int((time.time() - t0) * 1000),
+                        input_code=input_code,
+                        solc_version=chosen_solc
+                    )
 
                 t_out.join()
                 t_err.join()
@@ -262,7 +228,7 @@ def run(
                 metrics = {
                     "count": len(findings),
                     "solc_version": str(chosen_solc) if chosen_solc else None,
-                    "pragma": _detect_pragma(input_code),
+                    "pragma": detect_pragma(input_code),
                 }
                 if cp_returncode != 0:
                     warnings.append(f"NonZeroExit:{cp_returncode}")
@@ -282,28 +248,29 @@ def run(
                 }
             
             if cp_returncode not in (0,):
-                return _err(
-                    ["SlitherFailed", f"code={cp_returncode}", stderr or stdout],
-                    t0=t0,
+                return slither_failed_error(
+                    exit_code=cp_returncode,
+                    stderr=stderr or stdout,
+                    duration_ms=int((time.time() - t0) * 1000),
                     input_code=input_code,
-                    warnings_list=warnings,
-                    solc_ver=str(chosen_solc) if chosen_solc else None,
+                    warnings=warnings,
+                    solc_version=str(chosen_solc) if chosen_solc else None,
                     solc_bin=solc_bin
                 )
             if not out_json_path.exists():
-                return _err(
-                    ["NoJSONProduced", stderr or stdout],
-                    t0=t0,
+                return no_json_produced_error(
+                    stderr=stderr or stdout,
+                    duration_ms=int((time.time() - t0) * 1000),
                     input_code=input_code,
-                    warnings_list=warnings,
-                    solc_ver=str(chosen_solc) if chosen_solc else None,
+                    warnings=warnings,
+                    solc_version=str(chosen_solc) if chosen_solc else None,
                     solc_bin=solc_bin
                 )
             findings = []
             metrics = {
                 "count": 0,
                 "solc_version": str(chosen_solc) if chosen_solc else None,
-                "pragma": _detect_pragma(input_code),
+                "pragma": detect_pragma(input_code),
             }
     
             out: SlitherResult = {
@@ -325,10 +292,31 @@ def run(
             return out
     
     except subprocess.TimeoutExpired:
-        return _err(["Timeout"], t0=t0, input_code=input_code, warnings_list=warnings, solc_ver=chosen_solc)
+        return timeout_error(
+            duration_ms=int((time.time() - t0) * 1000),
+            input_code=input_code,
+            solc_version=chosen_solc
+        )
     except FileNotFoundError as e:
-        return _err(["SlitherNotFound", str(e)], t0=t0, input_code=input_code, warnings_list=warnings, solc_ver=chosen_solc)
+        return slither_not_found_error(
+            error=str(e),
+            duration_ms=int((time.time() - t0) * 1000),
+            input_code=input_code,
+            solc_version=chosen_solc
+        )
     except json.JSONDecodeError as e:
-        return _err(["InvalidJSON", str(e)], t0=t0, input_code=input_code, warnings_list=warnings, solc_ver=chosen_solc)
+        return invalid_json_error(
+            error=str(e),
+            duration_ms=int((time.time() - t0) * 1000),
+            input_code=input_code,
+            solc_version=chosen_solc
+        )
     except Exception as e:
-        return _err([type(e).__name__, str(e)], t0=t0, input_code=input_code, warnings_list=warnings, solc_ver=chosen_solc)
+        return ErrorHandler.create_slither_error(
+            ErrorCode.RUNTIME_ERROR,
+            message=f"{type(e).__name__}: {str(e)}",
+            duration_ms=int((time.time() - t0) * 1000),
+            input_code=input_code,
+            warnings=warnings,
+            solc_version=chosen_solc
+        )
