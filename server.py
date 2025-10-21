@@ -1,4 +1,5 @@
-from mcp_modules import parser_solidity, slither_wrapper   
+from mcp_modules import parser_solidity, slither_wrapper, surya_wrapper
+
 from mcp.server.fastmcp import FastMCP
 from pathlib import Path
 import json, re, time, os
@@ -239,7 +240,6 @@ def quick_find_ast_nodes(hash: str, node_type: str | None = None, name: str | No
             except Exception:
                 continue
     
-    # Remove duplicates while preserving order
     seen = set()
     unique_nodes = []
     for node in found_nodes:
@@ -479,6 +479,386 @@ def purge_cache(older_than_days: Optional[int] = None, size_limit_mb: Optional[i
             "status": "error",
             "error": str(e)
         }
+
+
+"""@mcp.tool()
+def surya_graph(input_code: str, simple: bool=False, include_modifiers: bool=False,
+                include_libraries: bool=True, format: str="dot", timeout_seconds: int=60) -> dict:
+    return surya_wrapper.graph(input_code, simple=simple, include_modifiers=include_modifiers,
+                               include_libraries=include_libraries, format=format, timeout_seconds=timeout_seconds)"""
+
+"""@mcp.tool()
+def surya_ftrace(input_code: str, entry: str, scope: str="all", timeout_seconds: int=60) -> dict:
+    return surya_wrapper.ftrace(input_code, entry=entry, scope=scope, timeout_seconds=timeout_seconds)"""
+
+"""@mcp.tool()
+def surya_inheritance(input_code: str, format: str="dot", timeout_seconds: int=60) -> dict:
+    return surya_wrapper.inheritance_graph(input_code, format=format, timeout_seconds=timeout_seconds)"""
+
+
+@mcp.tool()
+def get_callers(hash: str, contract: str, function: str) -> dict:
+    """
+    Find all functions that call the specified function in the given contract.
+    Returns structured data with evidence pointers.
+    """
+    try:
+        ast_path = AST_CACHE_DIR / f"{hash}.json"
+        if not ast_path.exists():
+            return {"status": "error", "error": "AST not found"}
+        
+        ast = json.loads(ast_path.read_text("utf-8"))
+        
+        target_function = None
+        target_pointer = None
+        
+        def find_function(node, path=""):
+            nonlocal target_function, target_pointer
+            if isinstance(node, dict):
+                if (node.get("nodeType") == "FunctionDefinition" and 
+                    node.get("name") == function):
+                    target_function = node
+                    target_pointer = path
+                    return
+                for key, value in node.items():
+                    if isinstance(value, (dict, list)):
+                        child_path = f"{path}/{key}" if path else f"/{key}"
+                        find_function(value, child_path)
+            elif isinstance(node, list):
+                for i, item in enumerate(node):
+                    child_path = f"{path}/{i}" if path else f"/{i}"
+                    find_function(item, child_path)
+        
+        find_function(ast)
+        
+        if not target_function:
+            return {"status": "error", "error": f"Function {function} not found in contract {contract}"}
+        
+
+        callers = []
+        
+        return {
+            "status": "ok",
+            "target": {"contract": contract, "function": function},
+            "callers": callers,
+            "evidence": [f"ast://{hash}#{target_pointer}"]
+        }
+        
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+@mcp.tool()
+def get_callees(hash: str, contract: str, function: str, call_type: str = "all") -> dict:
+    """
+    Find all functions called by the specified function.
+    
+    Args:
+        call_type: "internal", "external", or "all"
+    """
+    try:
+        # Get AST
+        ast_path = AST_CACHE_DIR / f"{hash}.json"
+        if not ast_path.exists():
+            return {"status": "error", "error": "AST not found"}
+        
+        ast = json.loads(ast_path.read_text("utf-8"))
+        
+        # Find the target function
+        target_function = None
+        target_pointer = None
+        
+        def find_function(node, path=""):
+            nonlocal target_function, target_pointer
+            if isinstance(node, dict):
+                if (node.get("nodeType") == "FunctionDefinition" and 
+                    node.get("name") == function):
+                    target_function = node
+                    target_pointer = path
+                    return
+                for key, value in node.items():
+                    if isinstance(value, (dict, list)):
+                        child_path = f"{path}/{key}" if path else f"/{key}"
+                        find_function(value, child_path)
+            elif isinstance(node, list):
+                for i, item in enumerate(node):
+                    child_path = f"{path}/{i}" if path else f"/{i}"
+                    find_function(item, child_path)
+        
+        find_function(ast)
+        
+        if not target_function:
+            return {"status": "error", "error": f"Function {function} not found in contract {contract}"}
+        
+    
+        callees = []
+        
+        return {
+            "status": "ok",
+            "source": {"contract": contract, "function": function},
+            "callees": callees,
+            "call_type_filter": call_type,
+            "evidence": [f"ast://{hash}#{target_pointer}"]
+        }
+        
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+@mcp.tool()
+def get_external_calls(hash: str, contract: str, function: str = None) -> dict:
+    """
+    Find all external calls in the contract or specific function.
+    Returns calls with target addresses and function selectors when available.
+    """
+    try:
+        ast_path = AST_CACHE_DIR / f"{hash}.json"
+        if not ast_path.exists():
+            return {"status": "error", "error": "AST not found"}
+        
+        ast = json.loads(ast_path.read_text("utf-8"))
+        
+        external_calls = []
+        
+        def find_external_calls(node, path="", current_function=None):
+            if isinstance(node, dict):
+                if node.get("nodeType") == "FunctionCall":
+                    expression = node.get("expression", {})
+                    if expression.get("nodeType") == "MemberAccess":
+                        member_name = expression.get("memberName", "")
+                        if member_name in ["call", "delegatecall", "staticcall", "send", "transfer"]:
+                            call_info = {
+                                "type": member_name,
+                                "function": current_function,
+                                "line": _get_line_from_src(node.get("src", "")),
+                                "evidence": [f"ast://{hash}#{path}"]
+                            }
+                            
+                            if "arguments" in node and node["arguments"]:
+                                first_arg = node["arguments"][0]
+                                if first_arg.get("nodeType") == "Identifier":
+                                    call_info["target"] = first_arg.get("name", "unknown")
+                            
+                            external_calls.append(call_info)
+                
+                if node.get("nodeType") == "FunctionDefinition":
+                    current_function = node.get("name", "unknown")
+                
+                for key, value in node.items():
+                    if isinstance(value, (dict, list)):
+                        child_path = f"{path}/{key}" if path else f"/{key}"
+                        find_external_calls(value, child_path, current_function)
+            elif isinstance(node, list):
+                for i, item in enumerate(node):
+                    child_path = f"{path}/{i}" if path else f"/{i}"
+                    find_external_calls(item, child_path, current_function)
+        
+        find_external_calls(ast)
+        
+        if function:
+            external_calls = [call for call in external_calls if call["function"] == function]
+        
+        return {
+            "status": "ok",
+            "contract": contract,
+            "function": function,
+            "external_calls": external_calls,
+            "total_calls": len(external_calls)
+        }
+        
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+def _get_line_from_src(src: str) -> int:
+    """Extract line number from src string like '123:45:67'"""
+    try:
+        return int(src.split(":")[0])
+    except:
+        return 0
+
+@mcp.tool()
+def get_state_writes(hash: str, contract: str, function: str = None) -> dict:
+    """
+    Find all state variable writes in the contract or specific function.
+    """
+    try:
+        ast_path = AST_CACHE_DIR / f"{hash}.json"
+        if not ast_path.exists():
+            return {"status": "error", "error": "AST not found"}
+        
+        ast = json.loads(ast_path.read_text("utf-8"))
+        
+        state_writes = []
+        
+        def find_state_writes(node, path="", current_function=None):
+            if isinstance(node, dict):
+                if node.get("nodeType") == "Assignment":
+                    left = node.get("leftHandSide", {})
+                    if left.get("nodeType") == "Identifier":
+                        var_name = left.get("name", "")
+                        if not _is_local_variable(var_name, current_function, ast):
+                            write_info = {
+                                "variable": var_name,
+                                "function": current_function,
+                                "line": _get_line_from_src(node.get("src", "")),
+                                "evidence": [f"ast://{hash}#{path}"]
+                            }
+                            state_writes.append(write_info)
+                
+                if node.get("nodeType") == "FunctionDefinition":
+                    current_function = node.get("name", "unknown")
+                
+                for key, value in node.items():
+                    if isinstance(value, (dict, list)):
+                        child_path = f"{path}/{key}" if path else f"/{key}"
+                        find_state_writes(value, child_path, current_function)
+            elif isinstance(node, list):
+                for i, item in enumerate(node):
+                    child_path = f"{path}/{i}" if path else f"/{i}"
+                    find_state_writes(item, child_path, current_function)
+        
+        find_state_writes(ast)
+        
+        if function:
+            state_writes = [write for write in state_writes if write["function"] == function]
+        
+        return {
+            "status": "ok",
+            "contract": contract,
+            "function": function,
+            "state_writes": state_writes,
+            "total_writes": len(state_writes)
+        }
+        
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+def _is_local_variable(var_name: str, function_name: str, ast: dict) -> bool:
+    """Check if variable is local to a function (simplified heuristic)"""
+    return var_name and var_name[0].islower()
+
+@mcp.tool()
+def get_payable_entrypoints(hash: str, contract: str) -> dict:
+    """
+    Find all functions that can receive ETH (payable functions and fallback/receive).
+    """
+    try:
+        ast_path = AST_CACHE_DIR / f"{hash}.json"
+        if not ast_path.exists():
+            return {"status": "error", "error": "AST not found"}
+        
+        ast = json.loads(ast_path.read_text("utf-8"))
+        
+        payable_functions = []
+        
+        def find_payable_functions(node, path=""):
+            if isinstance(node, dict):
+                if node.get("nodeType") == "FunctionDefinition":
+                    function_name = node.get("name", "")
+                    state_mutability = node.get("stateMutability", "")
+                    
+                    if state_mutability == "payable":
+                        func_info = {
+                            "name": function_name,
+                            "type": "payable_function",
+                            "visibility": node.get("visibility", "public"),
+                            "line": _get_line_from_src(node.get("src", "")),
+                            "evidence": [f"ast://{hash}#{path}"]
+                        }
+                        payable_functions.append(func_info)
+                    
+                    elif function_name == "" or function_name == "fallback":
+                        func_info = {
+                            "name": function_name or "fallback",
+                            "type": "fallback",
+                            "visibility": node.get("visibility", "external"),
+                            "line": _get_line_from_src(node.get("src", "")),
+                            "evidence": [f"ast://{hash}#{path}"]
+                        }
+                        payable_functions.append(func_info)
+                
+                for key, value in node.items():
+                    if isinstance(value, (dict, list)):
+                        child_path = f"{path}/{key}" if path else f"/{key}"
+                        find_payable_functions(value, child_path)
+            elif isinstance(node, list):
+                for i, item in enumerate(node):
+                    child_path = f"{path}/{i}" if path else f"/{i}"
+                    find_payable_functions(item, child_path)
+        
+        find_payable_functions(ast)
+        
+        return {
+            "status": "ok",
+            "contract": contract,
+            "payable_entrypoints": payable_functions,
+            "total_entrypoints": len(payable_functions)
+        }
+        
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+
+@mcp.tool()
+def get_modifier_map(hash: str, contract: str) -> dict:
+    """
+    Get mapping of modifiers to functions for ACL analysis.
+    """
+    try:
+        ast_path = AST_CACHE_DIR / f"{hash}.json"
+        if not ast_path.exists():
+            return {"status": "error", "error": "AST not found"}
+        
+        ast = json.loads(ast_path.read_text("utf-8"))
+        
+        modifier_map = {}
+        
+        def find_modifiers_and_functions(node, path=""):
+            if isinstance(node, dict):
+                if node.get("nodeType") == "ModifierDefinition":
+                    modifier_name = node.get("name", "")
+                    modifier_map[modifier_name] = {
+                        "type": "modifier",
+                        "line": _get_line_from_src(node.get("src", "")),
+                        "functions": [],
+                        "evidence": [f"ast://{hash}#{path}"]
+                    }
+                
+                elif node.get("nodeType") == "FunctionDefinition":
+                    function_name = node.get("name", "")
+                    modifiers = node.get("modifiers", [])
+                    
+                    for modifier in modifiers:
+                        modifier_name = modifier.get("modifierName", {}).get("name", "")
+                        if modifier_name in modifier_map:
+                            modifier_map[modifier_name]["functions"].append(function_name)
+                        else:
+                            if modifier_name not in modifier_map:
+                                modifier_map[modifier_name] = {
+                                    "type": "inherited_modifier",
+                                    "functions": [function_name],
+                                    "evidence": []
+                                }
+                
+                for key, value in node.items():
+                    if isinstance(value, (dict, list)):
+                        child_path = f"{path}/{key}" if path else f"/{key}"
+                        find_modifiers_and_functions(value, child_path)
+            elif isinstance(node, list):
+                for i, item in enumerate(node):
+                    child_path = f"{path}/{i}" if path else f"/{i}"
+                    find_modifiers_and_functions(item, child_path)
+        
+        find_modifiers_and_functions(ast)
+        
+        return {
+            "status": "ok",
+            "contract": contract,
+            "modifier_map": modifier_map,
+            "total_modifiers": len(modifier_map)
+        }
+        
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
 
 if __name__ == "__main__":
     mcp.run(transport="streamable-http")  

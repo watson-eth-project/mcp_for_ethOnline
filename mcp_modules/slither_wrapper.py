@@ -10,7 +10,7 @@ import os
 import sys
 import threading
 from pathlib import Path
-from typing import Any, Dict, List, Literal, TypedDict
+from typing import Any, Dict, List, Literal
 import shutil
 
 from .common.normalize import (
@@ -30,18 +30,13 @@ from .common.errors import (
     invalid_json_error
 )
 
-Status = Literal["ok", "error"]
-
-
-class SlitherResult(TypedDict, total=False):
-    status: Status
-    module: Literal["slither_wrapper"]
-    warnings: List[str]
-    errors: List[str]
-    meta: Dict[str, Any]
-    findings: List[Dict[str, Any]]
-    metrics: Dict[str, Any]
-    raw: Dict[str, Any]
+from .common.types import (
+    SlitherResult,
+    SlitherFinding,
+    SlitherElement,
+    SlitherMetrics,
+    SlitherMeta
+)
 
 
 
@@ -62,17 +57,17 @@ def _resolve_solc_bin(version: str) -> str:
     return solc_in_path or "solc"
     
 
-def _normalize_detectors(detectors: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _normalize_detectors(detectors: List[Dict[str, Any]]) -> List[SlitherFinding]:
     """Normalize the Slither output to a compact list of findings."""
-    out: List[Dict[str, Any]] = []
+    out: List[SlitherFinding] = []
     for d in detectors or []:
         check = d.get("check") or d.get("id") or ""
         impact = d.get("impact") or d.get("severity") or ""
         confidence = d.get("confidence") or ""
         desc = (d.get("description") or "").strip()
-        elements_norm: List[Dict[str, Any]] = []
+        elements_norm: List[SlitherElement] = []
         for e in d.get("elements", []) or []:
-            el = {
+            el: SlitherElement = {
                 "type": e.get("type"),
                 "name": e.get("name") or e.get("function") or "",
             }
@@ -80,15 +75,14 @@ def _normalize_detectors(detectors: List[Dict[str, Any]]) -> List[Dict[str, Any]
             el["line"] = sm.get("lines", [sm.get("start")])[0] if isinstance(sm.get("lines"), list) else sm.get("start")
             el["filename"] = sm.get("filename_absolute") or sm.get("filename_relative") or sm.get("filename")
             elements_norm.append(el)
-        out.append(
-            {
-                "check": check,
-                "severity": impact,
-                "confidence": confidence,
-                "description": desc,
-                "elements": elements_norm,
-            }
-        )
+        finding: SlitherFinding = {
+            "check": check,
+            "severity": impact,
+            "confidence": confidence,
+            "description": desc,
+            "elements": elements_norm,
+        }
+        out.append(finding)
     return out
 
 def _stream_pipe(pipe, prefix: str, collect: list[str]) -> None:
@@ -225,14 +219,15 @@ def run(
 
             if detectors:
                 findings = _normalize_detectors(detectors)
-                metrics = {
+                metrics: SlitherMetrics = {
                     "count": len(findings),
                     "solc_version": str(chosen_solc) if chosen_solc else None,
                     "pragma": detect_pragma(input_code),
                 }
                 if cp_returncode != 0:
                     warnings.append(f"NonZeroExit:{cp_returncode}")
-                return {
+                
+                result: SlitherResult = {
                     "status": "ok",
                     "module": "slither_wrapper",
                     "warnings": warnings,
@@ -244,8 +239,10 @@ def run(
                         "solc_version": str(chosen_solc) if chosen_solc else None,
                         "solc_bin": solc_bin,
                         "exit_code": cp_returncode,
+                        "module_version": "0.1.0",
                     },
                 }
+                return result
             
             if cp_returncode not in (0,):
                 return slither_failed_error(
@@ -266,8 +263,8 @@ def run(
                     solc_version=str(chosen_solc) if chosen_solc else None,
                     solc_bin=solc_bin
                 )
-            findings = []
-            metrics = {
+            findings: List[SlitherFinding] = []
+            metrics: SlitherMetrics = {
                 "count": 0,
                 "solc_version": str(chosen_solc) if chosen_solc else None,
                 "pragma": detect_pragma(input_code),
@@ -285,6 +282,7 @@ def run(
                     "solc_version": str(chosen_solc) if chosen_solc else None,
                     "solc_bin": solc_bin,
                     "exit_code": cp_returncode,
+                    "module_version": "0.1.0",
                 },
             }
             if return_raw:

@@ -11,6 +11,7 @@ dependencies = [
     "slither-analyzer>=0.11.3",
     "platformdirs>=4.0.0",
     "jsonpointer>=3.0.0",
+    "chromadb>=1.1.1",
 ]
 
 [tool.setuptools]
