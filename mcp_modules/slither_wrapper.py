@@ -437,7 +437,7 @@ def run_project_scan(
         if stderr:
             findings.extend(_parse_slither_output(stderr))
 
-=        severity_counts = {"high": 0, "medium": 0, "low": 0, "info": 0}
+        severity_counts = {"high": 0, "medium": 0, "low": 0, "info": 0}
         for finding in findings:
             severity = finding.get("severity", "info")
             if severity in severity_counts:
