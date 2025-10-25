@@ -318,6 +318,142 @@ def slither_scan(input_code: str, timeout_seconds: int = 120) -> dict:
     return slither_wrapper.run(input_code, timeout_seconds=timeout_seconds)
 
 @mcp.tool()
+def slither_project_scan(
+    project_path: str, 
+    timeout_seconds: int = 300, 
+    extra_args: List[str] = None,
+    stream_logs: bool = False,
+    foundry_mode: bool = True
+) -> dict:
+    """
+    Run Slither analysis on an entire project directory.
+    
+    Args:
+        project_path: Path to the project directory to analyze
+        timeout_seconds: Maximum time to wait for analysis (default: 300 seconds)
+        extra_args: Additional arguments to pass to Slither
+        stream_logs: If True, stream output logs in real-time
+        foundry_mode: If True, add --foundry flag for Foundry projects (default: True)
+    
+    This is equivalent to running: slither . --foundry
+    
+    Returns a detailed report with:
+    - findings: List of security issues found
+    - metrics: Summary statistics
+    - severity_breakdown: Count of issues by severity level
+    - raw_output: Complete stdout/stderr from Slither
+    """
+    return slither_wrapper.run_project_scan(
+        project_path=project_path,
+        timeout_seconds=timeout_seconds,
+        extra_args=extra_args,
+        stream_logs=stream_logs,
+        foundry_mode=foundry_mode
+    )
+
+@mcp.tool()
+def generate_slither_report(scan_result: dict) -> dict:
+    """
+    Generate a human-readable report from Slither scan results.
+    
+    Args:
+        scan_result: Result from slither_project_scan or slither_scan
+        
+    Returns:
+        Formatted report with summary, findings, and recommendations
+    """
+    if scan_result.get("status") != "ok":
+        return {
+            "status": "error",
+            "error": "Invalid scan result provided",
+            "scan_status": scan_result.get("status")
+        }
+    
+    findings = scan_result.get("findings", [])
+    metrics = scan_result.get("metrics", {})
+    meta = scan_result.get("meta", {})
+    
+    findings_by_severity = {
+        "high": [],
+        "medium": [],
+        "low": [],
+        "info": []
+    }
+    
+    for finding in findings:
+        severity = finding.get("severity", "info")
+        if severity in findings_by_severity:
+            findings_by_severity[severity].append(finding)
+    
+    total_findings = len(findings)
+    high_count = len(findings_by_severity["high"])
+    medium_count = len(findings_by_severity["medium"])
+    low_count = len(findings_by_severity["low"])
+    info_count = len(findings_by_severity["info"])
+    
+    risk_level = "LOW"
+    if high_count > 0:
+        risk_level = "CRITICAL"
+    elif medium_count > 3:
+        risk_level = "HIGH"
+    elif medium_count > 0 or low_count > 5:
+        risk_level = "MEDIUM"
+    
+    recommendations = []
+    if high_count > 0:
+        recommendations.append("🚨 CRITICAL: Address high-severity issues immediately")
+    if medium_count > 0:
+        recommendations.append("⚠️  MEDIUM: Review and fix medium-severity issues")
+    if low_count > 0:
+        recommendations.append("ℹ️  LOW: Consider addressing low-severity issues")
+    if total_findings == 0:
+        recommendations.append("✅ No security issues found - good job!")
+    
+    formatted_findings = []
+    for severity in ["high", "medium", "low", "info"]:
+        for finding in findings_by_severity[severity]:
+            elements = finding.get("elements", [])
+            file_refs = []
+            for element in elements:
+                if element.get("filename"):
+                    line_info = f":{element.get('line', 0)}" if element.get("line") else ""
+                    file_refs.append(f"{element['filename']}{line_info}")
+            
+            formatted_findings.append({
+                "severity": severity.upper(),
+                "check": finding.get("check", "unknown"),
+                "description": finding.get("description", ""),
+                "locations": file_refs,
+                "confidence": finding.get("confidence", "medium")
+            })
+    
+    return {
+        "status": "ok",
+        "report": {
+            "summary": {
+                "total_findings": total_findings,
+                "risk_level": risk_level,
+                "severity_breakdown": {
+                    "high": high_count,
+                    "medium": medium_count,
+                    "low": low_count,
+                    "info": info_count
+                },
+                "analysis_duration_ms": meta.get("duration_ms", 0),
+                "project_path": meta.get("project_path", "unknown")
+            },
+            "recommendations": recommendations,
+            "findings": formatted_findings,
+            "raw_metrics": metrics,
+            "scan_metadata": {
+                "foundry_mode": meta.get("foundry_mode", False),
+                "exit_code": meta.get("exit_code", 0),
+                "command": meta.get("raw_output", {}).get("command", "")
+            }
+        }
+    }
+
+@mcp.tool()
 def list_cached_asts() -> Dict[str, Any]:
     """
     List all cached AST files with metadata (size, modification time, etc.).
@@ -556,14 +692,12 @@ def get_callees(hash: str, contract: str, function: str, call_type: str = "all")
         call_type: "internal", "external", or "all"
     """
     try:
-        # Get AST
         ast_path = AST_CACHE_DIR / f"{hash}.json"
         if not ast_path.exists():
             return {"status": "error", "error": "AST not found"}
         
         ast = json.loads(ast_path.read_text("utf-8"))
         
-        # Find the target function
         target_function = None
         target_pointer = None
         
@@ -860,5 +994,352 @@ def get_modifier_map(hash: str, contract: str) -> dict:
     except Exception as e:
         return {"status": "error", "error": str(e)}
 
+
+@mcp.tool()
+def parse_solidity_file(path_to_file: str, engine: str = "solc", auto_version: bool = True, persist_ast: bool = True, create_index: bool = True) -> dict:
+    """
+    Parse a Solidity file from the filesystem and extract functions, modifiers, visibility, etc.
+    
+    Args:
+        path_to_file: Path to the Solidity file to parse
+        engine: Parser engine to use (currently only "solc" supported)
+        auto_version: If True, automatically detect solc version from pragma
+        persist_ast: If True, cache AST to disk for later access via ast_uri
+        create_index: If True, create index file for fast O(1) lookups
+    """
+    try:
+        file_path = Path(path_to_file)
+        
+        if not file_path.exists():
+            return {"status": "error", "error": f"File not found: {path_to_file}"}
+        
+        if not file_path.is_file():
+            return {"status": "error", "error": f"Path is not a file: {path_to_file}"}
+        
+        if not file_path.suffix.lower() == '.sol':
+            return {"status": "error", "error": f"File is not a Solidity file: {path_to_file}"}
+        
+        # Read file content
+        try:
+            file_content = file_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            return {"status": "error", "error": f"File encoding error: {path_to_file}"}
+        
+        if not file_content.strip():
+            return {"status": "error", "error": f"File is empty: {path_to_file}"}
+        
+        # Parse the file
+        result = parser_solidity.run(
+            file_content, 
+            engine=engine,
+            auto_version=auto_version,
+            persist_ast=persist_ast,
+        )
+        
+        # Add file metadata to result
+        if result.get("status") == "ok":
+            result["file_info"] = {
+                "path": str(file_path.absolute()),
+                "name": file_path.name,
+                "size_bytes": file_path.stat().st_size,
+                "modified_at": file_path.stat().st_mtime
+            }
+            
+            # Create index if requested
+            if persist_ast and create_index and "ast_uri" in result:
+                try:
+                    ast_uri = result["ast_uri"]
+                    if ast_uri.startswith("ast://"):
+                        hash_name = ast_uri[6:] 
+                        
+                        ast_path = AST_CACHE_DIR / f"{hash_name}.json"
+                        if ast_path.exists():
+                            ast = json.loads(ast_path.read_text(encoding="utf-8"))
+                            index = _create_ast_index(ast, hash_name)
+                            _save_ast_index(index, hash_name)
+                            
+                            result["index_created"] = True
+                            result["index_stats"] = {
+                                "node_types": len(index["nodeType"]),
+                                "names": len(index["name"])
+                            }
+                except Exception as e:
+                    result["index_error"] = str(e)
+        
+        return result
+        
+    except Exception as e:
+        return {"status": "error", "error": f"Failed to parse file: {str(e)}"}
+
+
+@mcp.tool()
+def slither_scan_file(path_to_file: str, timeout_seconds: int = 120, extra_args: List[str] = None) -> dict:
+    """
+    Run Slither static analysis on a Solidity file from the filesystem.
+    
+    Args:
+        path_to_file: Path to the Solidity file to analyze
+        timeout_seconds: Maximum time to wait for analysis to complete
+        extra_args: Additional arguments to pass to Slither
+    """
+    try:
+        file_path = Path(path_to_file)
+        
+        if not file_path.exists():
+            return {"status": "error", "error": f"File not found: {path_to_file}"}
+        
+        if not file_path.is_file():
+            return {"status": "error", "error": f"Path is not a file: {path_to_file}"}
+        
+        if not file_path.suffix.lower() == '.sol':
+            return {"status": "error", "error": f"File is not a Solidity file: {path_to_file}"}
+        
+        # Read file content
+        try:
+            file_content = file_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            return {"status": "error", "error": f"File encoding error: {path_to_file}"}
+        
+        if not file_content.strip():
+            return {"status": "error", "error": f"File is empty: {path_to_file}"}
+        
+        result = slither_wrapper.run(
+            file_content, 
+            timeout_seconds=timeout_seconds,
+            extra_args=extra_args
+        )
+        
+        if result.get("status") == "ok":
+            result["file_info"] = {
+                "path": str(file_path.absolute()),
+                "name": file_path.name,
+                "size_bytes": file_path.stat().st_size,
+                "modified_at": file_path.stat().st_mtime
+            }
+        
+        return result
+        
+    except Exception as e:
+        return {"status": "error", "error": f"Failed to analyze file: {str(e)}"}
+
+@mcp.tool()
+def slither_scan_directory(
+    path_to_directory: str, 
+    timeout_seconds: int = 300, 
+    extra_args: List[str] = None,
+    stream_logs: bool = False,
+    foundry_mode: bool = True
+) -> dict:
+    """
+    Run Slither analysis on a directory containing Solidity files.
+    
+    Args:
+        path_to_directory: Path to the directory to analyze
+        timeout_seconds: Maximum time to wait for analysis (default: 300 seconds)
+        extra_args: Additional arguments to pass to Slither
+        stream_logs: If True, stream output logs in real-time
+        foundry_mode: If True, add --foundry flag for Foundry projects (default: True)
+    
+    This is equivalent to running: slither <directory> --foundry
+    """
+    try:
+        dir_path = Path(path_to_directory)
+        
+        if not dir_path.exists():
+            return {"status": "error", "error": f"Directory not found: {path_to_directory}"}
+        
+        if not dir_path.is_dir():
+            return {"status": "error", "error": f"Path is not a directory: {path_to_directory}"}
+        
+        result = slither_wrapper.run_project_scan(
+            project_path=str(dir_path),
+            timeout_seconds=timeout_seconds,
+            extra_args=extra_args,
+            stream_logs=stream_logs,
+            foundry_mode=foundry_mode
+        )
+        
+        if result.get("status") == "ok":
+            result["directory_info"] = {
+                "path": str(dir_path.absolute()),
+                "name": dir_path.name,
+                "foundry_mode": foundry_mode
+            }
+        
+        return result
+        
+    except Exception as e:
+        return {"status": "error", "error": f"Failed to analyze directory: {str(e)}"}
+
+
+@mcp.tool()
+def analyze_solidity_file(path_to_file: str, include_slither: bool = True, timeout_seconds: int = 120) -> dict:
+    """
+    Comprehensive analysis of a Solidity file including parsing and static analysis.
+    
+    Args:
+        path_to_file: Path to the Solidity file to analyze
+        include_slither: If True, include Slither static analysis
+        timeout_seconds: Maximum time to wait for Slither analysis
+    """
+    try:
+        file_path = Path(path_to_file)
+        
+        if not file_path.exists():
+            return {"status": "error", "error": f"File not found: {path_to_file}"}
+        
+        if not file_path.is_file():
+            return {"status": "error", "error": f"Path is not a file: {path_to_file}"}
+        
+        if not file_path.suffix.lower() == '.sol':
+            return {"status": "error", "error": f"File is not a Solidity file: {path_to_file}"}
+        
+        try:
+            file_content = file_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            return {"status": "error", "error": f"File encoding error: {path_to_file}"}
+        
+        if not file_content.strip():
+            return {"status": "error", "error": f"File is empty: {path_to_file}"}
+        
+        parse_result = parser_solidity.run(
+            file_content, 
+            engine="solc",
+            auto_version=True,
+            persist_ast=True,
+        )
+        
+        result = {
+            "status": "ok",
+            "file_info": {
+                "path": str(file_path.absolute()),
+                "name": file_path.name,
+                "size_bytes": file_path.stat().st_size,
+                "modified_at": file_path.stat().st_mtime
+            },
+            "parsing": parse_result
+        }
+        
+        if include_slither:
+            slither_result = slither_wrapper.run(
+                file_content, 
+                timeout_seconds=timeout_seconds
+            )
+            result["slither_analysis"] = slither_result
+        
+        if parse_result.get("status") == "ok" and "ast_uri" in parse_result:
+            try:
+                ast_uri = parse_result["ast_uri"]
+                if ast_uri.startswith("ast://"):
+                    hash_name = ast_uri[6:] 
+                    
+                    ast_path = AST_CACHE_DIR / f"{hash_name}.json"
+                    if ast_path.exists():
+                        ast = json.loads(ast_path.read_text(encoding="utf-8"))
+                        index = _create_ast_index(ast, hash_name)
+                        _save_ast_index(index, hash_name)
+                        
+                        result["index_created"] = True
+                        result["index_stats"] = {
+                            "node_types": len(index["nodeType"]),
+                            "names": len(index["name"])
+                        }
+            except Exception as e:
+                result["index_error"] = str(e)
+        
+        return result
+        
+    except Exception as e:
+        return {"status": "error", "error": f"Failed to analyze file: {str(e)}"}
+
+
+@mcp.tool()
+def parse_solidity_directory(path_to_directory: str, engine: str = "solc", auto_version: bool = True, persist_ast: bool = True, create_index: bool = True) -> dict:
+    """
+    Parse all Solidity files in a directory and extract functions, modifiers, visibility, etc.
+    
+    Args:
+        path_to_directory: Path to the directory containing Solidity files
+        engine: Parser engine to use (currently only "solc" supported)
+        auto_version: If True, automatically detect solc version from pragma
+        persist_ast: If True, cache AST to disk for later access via ast_uri
+        create_index: If True, create index file for fast O(1) lookups
+    """
+    try:
+        dir_path = Path(path_to_directory)
+        
+        if not dir_path.exists():
+            return {"status": "error", "error": f"Directory not found: {path_to_directory}"}
+        
+        if not dir_path.is_dir():
+            return {"status": "error", "error": f"Path is not a directory: {path_to_directory}"}
+        
+        # Find all .sol files recursively
+        sol_files = list(dir_path.rglob("*.sol"))
+        
+        if not sol_files:
+            return {"status": "error", "error": f"No Solidity files found in directory: {path_to_directory}"}
+        
+        # Read all files
+        files_content = {}
+        file_errors = []
+        
+        for sol_file in sol_files:
+            try:
+                relative_path = sol_file.relative_to(dir_path)
+                files_content[str(relative_path)] = sol_file.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                file_errors.append(f"Encoding error in {sol_file}")
+            except Exception as e:
+                file_errors.append(f"Error reading {sol_file}: {str(e)}")
+        
+        if not files_content:
+            return {"status": "error", "error": f"Could not read any files from directory: {path_to_directory}"}
+        
+        # Parse all files together
+        result = parser_solidity.run(
+            files_content, 
+            engine=engine,
+            auto_version=auto_version,
+            persist_ast=persist_ast,
+        )
+        
+        # Add directory metadata to result
+        if result.get("status") == "ok":
+            result["directory_info"] = {
+                "path": str(dir_path.absolute()),
+                "total_files": len(sol_files),
+                "parsed_files": len(files_content),
+                "file_errors": file_errors,
+                "files": [str(f.relative_to(dir_path)) for f in sol_files]
+            }
+            
+            # Create index if requested
+            if persist_ast and create_index and "ast_uri" in result:
+                try:
+                    ast_uri = result["ast_uri"]
+                    if ast_uri.startswith("ast://"):
+                        hash_name = ast_uri[6:] 
+                        
+                        ast_path = AST_CACHE_DIR / f"{hash_name}.json"
+                        if ast_path.exists():
+                            ast = json.loads(ast_path.read_text(encoding="utf-8"))
+                            index = _create_ast_index(ast, hash_name)
+                            _save_ast_index(index, hash_name)
+                            
+                            result["index_created"] = True
+                            result["index_stats"] = {
+                                "node_types": len(index["nodeType"]),
+                                "names": len(index["name"])
+                            }
+                except Exception as e:
+                    result["index_error"] = str(e)
+        
+        return result
+        
+    except Exception as e:
+        return {"status": "error", "error": f"Failed to parse directory: {str(e)}"}
+
 if __name__ == "__main__":
-    mcp.run(transport="streamable-http")  
+    mcp.run(transport="stdio")  
+    #mcp.run(transport="streamable-http")  

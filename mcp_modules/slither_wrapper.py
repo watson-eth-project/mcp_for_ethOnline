@@ -318,3 +318,289 @@ def run(
             warnings=warnings,
             solc_version=chosen_solc
         )
+
+
+def run_project_scan(
+    project_path: str,
+    *,
+    timeout_seconds: int = 300,
+    extra_args: List[str] | None = None,
+    stream_logs: bool = False,
+    foundry_mode: bool = True
+) -> SlitherResult:
+    """
+    Run Slither analysis on an entire project directory.
+    
+    Args:
+        project_path: Path to the project directory to analyze
+        timeout_seconds: Maximum time to wait for analysis
+        extra_args: Additional arguments to pass to Slither
+        stream_logs: If True, stream output logs in real-time
+        foundry_mode: If True, add --foundry flag for Foundry projects
+    """
+    t0 = time.time()
+    warnings: List[str] = []
+    
+    project_dir = Path(project_path)
+    if not project_dir.exists():
+        return ErrorHandler.create_slither_error(
+            ErrorCode.EMPTY_INPUT,
+            message=f"Project directory not found: {project_path}",
+            duration_ms=int((time.time() - t0) * 1000)
+        )
+    
+    if not project_dir.is_dir():
+        return ErrorHandler.create_slither_error(
+            ErrorCode.EMPTY_INPUT,
+            message=f"Path is not a directory: {project_path}",
+            duration_ms=int((time.time() - t0) * 1000)
+        )
+
+    env = os.environ.copy()
+    env.setdefault("PYTHONUNBUFFERED", "1")
+
+    try:
+        # Build command for project analysis
+        cmd = ["slither", str(project_dir)]
+        
+        if foundry_mode:
+            cmd.append("--foundry")
+        
+        if extra_args:
+            cmd.extend(extra_args)
+
+        stdout = ''
+        stderr = ''
+
+        if stream_logs:
+            cp = subprocess.Popen(
+                cmd,
+                cwd=str(project_dir),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                env=env,
+            )
+            stdout_lines: list[str] = []
+            stderr_lines: list[str] = []
+
+            t_out = threading.Thread(target=_stream_pipe, args=(cp.stdout, "stdout", stdout_lines))
+            t_err = threading.Thread(target=_stream_pipe, args=(cp.stderr, "stderr", stderr_lines))
+            t_out.start(); t_err.start()
+
+            try:
+                rc = cp.wait(timeout=timeout_seconds)
+            except subprocess.TimeoutExpired:
+                try:
+                    cp.kill()
+                except Exception:
+                    pass
+                t_out.join(timeout=1)
+                t_err.join(timeout=1)
+                return timeout_error(
+                    duration_ms=int((time.time() - t0) * 1000),
+                    input_code=f"Project: {project_path}",
+                    solc_version=None
+                )
+
+            t_out.join()
+            t_err.join()
+            stdout = "\n".join(stdout_lines)
+            stderr = "\n".join(stderr_lines)
+            cp_returncode = rc
+        else:
+            cp = subprocess.run(
+                cmd,
+                cwd=str(project_dir),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=timeout_seconds,
+                env=env,
+            )
+            stdout = (cp.stdout or "").strip()
+            stderr = (cp.stderr or "").strip()
+            cp_returncode = cp.returncode
+
+        if stderr:
+            for line in stderr.splitlines():
+                ln = line.strip()
+                if ln and not ln.lower().startswith(("slither", "loading")):
+                    warnings.append(ln)
+
+        findings: List[SlitherFinding] = []
+        
+        if stdout:
+            findings.extend(_parse_slither_output(stdout))
+        
+        if stderr:
+            findings.extend(_parse_slither_output(stderr))
+
+=        severity_counts = {"high": 0, "medium": 0, "low": 0, "info": 0}
+        for finding in findings:
+            severity = finding.get("severity", "info")
+            if severity in severity_counts:
+                severity_counts[severity] += 1
+
+        metrics: SlitherMetrics = {
+            "count": len(findings),
+            "solc_version": None,  
+            "pragma": None,  
+            "severity_breakdown": severity_counts,
+        }
+        
+        if cp_returncode != 0:
+            warnings.append(f"NonZeroExit:{cp_returncode}")
+        
+        status = "ok"
+        if cp_returncode != 0 and not findings:
+            status = "error"
+        elif findings and any(f.get("severity") in ["high", "critical"] for f in findings):
+            status = "warning"
+        
+        result: SlitherResult = {
+            "status": status,
+            "module": "slither_wrapper",
+            "warnings": warnings,
+            "errors": [],
+            "findings": findings,
+            "metrics": metrics,
+            "meta": {
+                "duration_ms": int((time.time() - t0) * 1000),
+                "solc_version": None,
+                "solc_bin": "project_scan",
+                "exit_code": cp_returncode,
+                "module_version": "0.1.0",
+                "project_path": str(project_dir.absolute()),
+                "foundry_mode": foundry_mode,
+                "raw_output": {
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "command": " ".join(cmd)
+                }
+            },
+        }
+        return result
+
+    except subprocess.TimeoutExpired:
+        return timeout_error(
+            duration_ms=int((time.time() - t0) * 1000),
+            input_code=f"Project: {project_path}",
+            solc_version=None
+        )
+    except FileNotFoundError as e:
+        return slither_not_found_error(
+            error=str(e),
+            duration_ms=int((time.time() - t0) * 1000),
+            input_code=f"Project: {project_path}",
+            solc_version=None
+        )
+    except Exception as e:
+        return ErrorHandler.create_slither_error(
+            ErrorCode.RUNTIME_ERROR,
+            message=f"{type(e).__name__}: {str(e)}",
+            duration_ms=int((time.time() - t0) * 1000),
+            input_code=f"Project: {project_path}",
+            warnings=warnings,
+            solc_version=None
+        )
+
+
+def _parse_slither_output(output: str) -> List[SlitherFinding]:
+    """
+    Parse Slither's text output to extract findings.
+    Enhanced parser that handles various Slither output formats.
+    """
+    findings: List[SlitherFinding] = []
+    
+    lines = output.splitlines()
+    current_finding = None
+    current_description_lines = []
+    
+    for i, line in enumerate(lines):
+        line = line.strip()
+        if not line:
+            continue
+        
+        finding_patterns = [
+            (r"^Reference:", "info"),
+            (r"^INFO:", "info"), 
+            (r"^WARNING:", "medium"),
+            (r"^ERROR:", "high"),
+            (r"^CRITICAL:", "high"),
+            (r"^.*\.sol.*\[.*\].*:", "medium"),  
+            (r"^Function.*:", "medium"),
+            (r"^Contract.*:", "medium"),
+        ]
+        
+        is_finding_start = False
+        severity = "info"
+        
+        for pattern, sev in finding_patterns:
+            if re.match(pattern, line):
+                is_finding_start = True
+                severity = sev
+                break
+        
+        if is_finding_start:
+            if current_finding:
+                current_finding["description"] = "\n".join(current_description_lines).strip()
+                findings.append(current_finding)
+            
+            current_description_lines = [line]
+            
+            check_name = "project_scan"
+            description = line
+            
+            if ":" in line:
+                parts = line.split(":", 1)
+                if len(parts) == 2:
+                    potential_check = parts[0].strip()
+                    description = parts[1].strip()
+                    
+                    if any(keyword in potential_check.lower() for keyword in 
+                           ["reentrancy", "unchecked", "overflow", "underflow", "access", "control"]):
+                        check_name = potential_check.lower().replace(" ", "_")
+            
+            current_finding: SlitherFinding = {
+                "check": check_name,
+                "severity": severity,
+                "confidence": "medium",
+                "description": description,
+                "elements": []
+            }
+        
+        elif line.startswith("[") and line.endswith("]"):
+            if current_finding:
+                ref = line[1:-1]  
+                if ":" in ref:
+                    filename, line_num = ref.split(":", 1)
+                    element: SlitherElement = {
+                        "type": "source",
+                        "name": "",
+                        "line": int(line_num) if line_num.isdigit() else 0,
+                        "filename": filename
+                    }
+                    current_finding["elements"].append(element)
+        
+        elif "(" in line and ")" in line and current_finding:
+            match = re.search(r'(\w+)\s*\(', line)
+            if match:
+                func_name = match.group(1)
+                element: SlitherElement = {
+                    "type": "function",
+                    "name": func_name,
+                    "line": 0,
+                    "filename": ""
+                }
+                current_finding["elements"].append(element)
+        
+        elif current_finding and not line.startswith("[") and not line.startswith("Function"):
+            current_description_lines.append(line)
+    
+    if current_finding:
+        current_finding["description"] = "\n".join(current_description_lines).strip()
+        findings.append(current_finding)
+    
+    return findings

@@ -76,11 +76,16 @@ def _compile_to_ast_with_solc(input_code: str | Dict[str, str], solc_version: st
         sources = {filename: {"content": content} for filename, content in input_code.items()}
         source_list = list(input_code.keys())
     
+    # Create output selection for each source file
+    output_selection = {}
+    for filename in source_list:
+        output_selection[filename] = {"": ["ast", "legacyAST"]}
+    
     std_input = {
         "language": "Solidity",
         "sources": sources,
         "settings": {
-            "outputSelection": {"*": {"": ["ast", "legacyAST"]}},
+            "outputSelection": output_selection,
         },
     }
     out = compile_standard(std_input, allow_paths=".")
@@ -149,7 +154,7 @@ def _extract_src_from_ast(node: Dict[str, Any], filename: str, src_mapping: Dict
             if isinstance(item, (dict, list)):
                 _extract_src_from_ast(item, filename, src_mapping)
 
-def _extract_contracts_with_members(ast: Dict[str, Any], source_text: str | Dict[str, str]) -> List[ContractDefinition]:
+def _extract_contracts_with_members(ast: Dict[str, Any], source_text: str | Dict[str, str], src_mapping: Dict[str, SourceMapping] = None) -> List[ContractDefinition]:
     contracts: List[ContractDefinition] = []
 
     def _extract_contract_header(node: Dict[str, Any]) -> Dict[str, Any]:
@@ -165,7 +170,7 @@ def _extract_contracts_with_members(ast: Dict[str, Any], source_text: str | Dict
     def walk(node: Dict[str, Any]) -> None:
         if node_kind(node) == "ContractDefinition":
             header = _extract_contract_header(node)
-            members = _collect_from_contract(node, source_text)
+            members = _collect_from_contract(node, source_text, src_mapping)
             contracts.append(
                 {
                     **header,
@@ -229,7 +234,7 @@ def _func_signature(name: str, inputs: List[FunctionParameter], returns: List[Fu
     return f"{name}({ins})"
 
 
-def _collect_from_contract(contract_node: Dict[str, Any], source_text: str | Dict[str, str]) -> Dict[str, List[Any]]:
+def _collect_from_contract(contract_node: Dict[str, Any], source_text: str | Dict[str, str], src_mapping: Dict[str, SourceMapping] = None) -> Dict[str, List[Any]]:
     functions: List[FunctionDefinition] = []
     modifiers_decl: List[ModifierDefinition] = []
     events: List[EventDefinition] = []
@@ -266,7 +271,19 @@ def _collect_from_contract(contract_node: Dict[str, Any], source_text: str | Dic
             display_name = fn_name or fn_kind
 
             pos = src_span(ch)
-            start_line = line_from_offset(source_text, pos["offsetStart"])
+            
+            # Handle multi-file case by determining which file this function belongs to
+            if isinstance(source_text, dict) and src_mapping and fn_src:
+                # Get the filename from src_mapping
+                src_info = src_mapping.get(fn_src)
+                if src_info and src_info["filename"] in source_text:
+                    file_content = source_text[src_info["filename"]]
+                    start_line = line_from_offset(file_content, pos["offsetStart"])
+                else:
+                    start_line = None
+            else:
+                # Single file case
+                start_line = line_from_offset(source_text, pos["offsetStart"])
 
             position: FunctionPosition = {
                 "offset_start": pos["offsetStart"],
@@ -396,7 +413,13 @@ def run(
         steps = []
         
         if auto_version:
-            chosen = ensure_solc_auto_by_pragma(input_code, fallback_version=solc_version or "0.8.26")
+            # Handle multi-file case for pragma extraction
+            if isinstance(input_code, str):
+                pragma_input = input_code
+            else:
+                # Use the first file for pragma detection
+                pragma_input = next(iter(input_code.values()))
+            chosen = ensure_solc_auto_by_pragma(pragma_input, fallback_version=solc_version or "0.8.26")
         else:
             chosen = solc_version or "0.8.26"
             ensure_solc(chosen)
@@ -408,7 +431,19 @@ def run(
         
         src_mapping = _create_src_mapping(ast, source_list)
         
-        contracts = _extract_contracts_with_members(ast, input_code)
+        # Extract contracts from each source file
+        contracts = []
+        if isinstance(input_code, str):
+            # Single file case
+            contracts = _extract_contracts_with_members(ast, input_code, src_mapping)
+        else:
+            # Multi-file case - extract from each source AST
+            sources = ast.get("sources", {})
+            for filename in source_list:
+                if filename in sources and "ast" in sources[filename]:
+                    source_ast = sources[filename]["ast"]
+                    source_contracts = _extract_contracts_with_members(source_ast, input_code[filename], src_mapping)
+                    contracts.extend(source_contracts)
 
         if isinstance(input_code, str):
             pragma = extract_pragma(input_code)
