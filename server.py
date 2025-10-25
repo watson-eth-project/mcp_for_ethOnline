@@ -1341,5 +1341,6 @@ def parse_solidity_directory(path_to_directory: str, engine: str = "solc", auto_
         return {"status": "error", "error": f"Failed to parse directory: {str(e)}"}
 
 if __name__ == "__main__":
-    mcp.run(transport="stdio")  
-    #mcp.run(transport="streamable-http")  
+   # mcp.run(transport="stdio")  
+    mcp.settings.host = "0.0.0.0"
+    mcp.run(transport="streamable-http")  

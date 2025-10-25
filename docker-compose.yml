@@ -1,0 +1,27 @@
+services:
+  mcp-modules:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mcp-modules-server
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount cache directory for persistent AST caching
+      - mcp_cache:/tmp/ast_cache
+      # Mount source code for development (optional)
+      - ./mcp_modules:/app/mcp_modules:ro
+    environment:
+      - PYTHONPATH=/app
+      - MCP_CACHE_DIR=/tmp/ast_cache
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import mcp_modules; print('MCP modules loaded successfully')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+volumes:
+  mcp_cache:
+    driver: local
