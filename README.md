@@ -2,6 +2,10 @@
 
 A Model Context Protocol (MCP) server for Solidity smart contract analysis using Slither and custom parsing tools.
 
+## Deployed MCP
+
+https://mcp-ethonline-production.up.railway.app/mcp
+
 ## What This Code Does
 
 This project provides a comprehensive toolkit for analyzing Solidity smart contracts through multiple approaches:
@@ -31,10 +35,13 @@ This project provides a comprehensive toolkit for analyzing Solidity smart contr
 
 ### Prerequisites
 
-- Python 3.8+
+- Python 3.11+
 - [uv](https://github.com/astral-sh/uv) package manager
+- Docker (optional, for containerized deployment)
 
 ### Setup
+
+#### Option 1: Local Installation
 
 1. Clone the repository:
 ```bash
@@ -52,24 +59,83 @@ uv sync
 pip install slither-analyzer
 ```
 
+#### Option 2: Docker Installation
+
+1. Clone the repository:
+```bash
+git clone <repository-url>
+cd mcp_modules
+```
+
+2. Build and run with Docker Compose:
+```bash
+# Build and start the container
+docker-compose up --build
+
+# Run in detached mode
+docker-compose up -d --build
+
+# View logs
+docker-compose logs -f
+
+# Stop the container
+docker-compose down
+```
+
+3. Or build and run with Docker directly:
+```bash
+# Build the image
+docker build -t mcp-modules .
+
+# Run the container
+docker run -p 3000:3000 -v mcp_cache:/tmp/ast_cache mcp-modules
+```
+
 ## Usage
 
 ### Running Tests
 
+#### Local Testing
 ```bash
 uv run pytest -q
 ```
 
+#### Docker Testing
+```bash
+# Run tests in Docker container
+docker-compose run --rm mcp-modules uv run pytest -q
+
+# Or with direct Docker command
+docker run --rm mcp-modules uv run pytest -q
+```
+
 ### Starting the MCP Server
 
+#### Local Development
 ```bash
 uv run server.py
 ```
 
+#### Docker Development
+```bash
+# Using Docker Compose (recommended)
+docker-compose up --build
+
+# Using Docker directly
+docker run -p 3000:3000 mcp-modules
+```
+
 ### Development Mode
 
+#### Local Development
 ```bash
 uv run mcp dev server.py
+```
+
+#### Docker Development
+```bash
+# Mount source code for live development
+docker run -p 3000:3000 -v $(pwd)/mcp_modules:/app/mcp_modules mcp-modules
 ```
 
 ### Example Usage
@@ -124,8 +190,33 @@ mcp_modules/
 ├── tests/                 # Test suite
 ├── server.py             # MCP server entry point
 ├── pyproject.toml        # Project configuration
+├── Dockerfile            # Docker container definition
+├── docker-compose.yml    # Docker Compose configuration
+├── .dockerignore         # Docker ignore file
 └── README.md             # This file
 ```
+
+## Docker Configuration
+
+The project includes comprehensive Docker support:
+
+### Dockerfile Features
+- **Base Image**: Python 3.11 slim for optimal size
+- **System Dependencies**: Includes build tools for Solidity compilation
+- **Package Management**: Uses `uv` for fast dependency resolution
+- **Cache Management**: Persistent AST cache volume
+- **Health Checks**: Built-in container health monitoring
+
+### Docker Compose Features
+- **Service Management**: Easy start/stop/restart
+- **Volume Persistence**: AST cache survives container restarts
+- **Port Mapping**: MCP server accessible on port 3000
+- **Development Mode**: Source code mounting for live development
+- **Health Monitoring**: Automatic health checks and restart policies
+
+### Container Volumes
+- `mcp_cache`: Persistent storage for compiled AST files
+- Source code mounting for development (optional)
 ## TODO
 
 - парсер пока скидывает все в одну кучу (если код передается для нескольких контрактов сразу)
